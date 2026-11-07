@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/sysinfo.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -133,7 +135,7 @@ static size_t audit_aur_packages(CURL *curl, struct foreign_pkg *pkgs,
     return 0;
 
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-  curl_easy_setopt(curl, CURLOPT_USERAGENT, "upgrade-alpm/2.4");
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "upgrade-alpm/2.5");
   curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // Enable gzip/deflate
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
 
@@ -273,6 +275,205 @@ static size_t audit_aur_packages(CURL *curl, struct foreign_pkg *pkgs,
   }
 
   return aur_updates;
+}
+
+// Reads the tail of /var/log/pacman.log to find the UTC timestamp of the most
+// recent upgrade/install transaction, or 0 if unavailable.
+static time_t last_pacman_upgrade_time(void) {
+  FILE *fp = fopen("/var/log/pacman.log", "r");
+  if (!fp)
+    return 0;
+
+  if (fseek(fp, 0, SEEK_END) == 0) {
+    long end = ftell(fp);
+    if (end > 262144) {
+      fseek(fp, end - 262144, SEEK_SET);
+      char discard[512];
+      if (!fgets(discard, sizeof(discard), fp)) {
+        fclose(fp);
+        return 0;
+      }
+    } else {
+      rewind(fp);
+    }
+  }
+
+  time_t last = 0;
+  char line[1024];
+  while (fgets(line, sizeof(line), fp)) {
+    if (line[0] != '[')
+      continue;
+    if (!strstr(line, "[PACMAN] starting full system upgrade") &&
+        !strstr(line, "[ALPM] upgraded ") && !strstr(line, "[ALPM] installed "))
+      continue;
+
+    int y, mo, d, H, M, S, tzh, tzm;
+    char tzs;
+    if (sscanf(line, "[%d-%d-%dT%d:%d:%d%c%2d%2d]", &y, &mo, &d, &H, &M, &S,
+               &tzs, &tzh, &tzm) == 9) {
+      struct tm tm;
+      memset(&tm, 0, sizeof(tm));
+      tm.tm_year = y - 1900;
+      tm.tm_mon = mo - 1;
+      tm.tm_mday = d;
+      tm.tm_hour = H;
+      tm.tm_min = M;
+      tm.tm_sec = S;
+      time_t t = timegm(&tm);
+      if (t != (time_t)-1) {
+        long off = (long)tzh * 3600L + (long)tzm * 60L;
+        last = (tzs == '-') ? (t + off) : (t - off);
+      }
+    }
+  }
+  fclose(fp);
+  return last;
+}
+
+// Locale-independent parser for RSS RFC-2822 dates, e.g.:
+// "Wed, 21 Oct 2026 13:58:42 +0000"
+static time_t parse_rfc2822_date(const char *s) {
+  static const char *const months[12] = {"Jan", "Feb", "Mar", "Apr",
+                                         "May", "Jun", "Jul", "Aug",
+                                         "Sep", "Oct", "Nov", "Dec"};
+  const char *comma = strchr(s, ',');
+  if (comma)
+    s = comma + 1;
+
+  int d, y, H, M, S, tzh = 0, tzm = 0;
+  char mon[4] = "", tzs = '+';
+  int n = sscanf(s, " %d %3s %d %d:%d:%d %c%2d%2d", &d, mon, &y, &H, &M, &S,
+                 &tzs, &tzh, &tzm);
+  if (n < 6)
+    return 0;
+
+  int mi = -1;
+  for (int i = 0; i < 12; i++) {
+    if (strncmp(mon, months[i], 3) == 0) {
+      mi = i;
+      break;
+    }
+  }
+  if (mi < 0)
+    return 0;
+
+  struct tm tm;
+  memset(&tm, 0, sizeof(tm));
+  tm.tm_year = y - 1900;
+  tm.tm_mon = mi;
+  tm.tm_mday = d;
+  tm.tm_hour = H;
+  tm.tm_min = M;
+  tm.tm_sec = S;
+  time_t t = timegm(&tm);
+  if (t == (time_t)-1)
+    return 0;
+  long off = (long)tzh * 3600L + (long)tzm * 60L;
+  return (tzs == '-') ? (t + off) : (t - off);
+}
+
+// Extracts text between `open_tag` and `close_tag` inside [start, end),
+// decoding basic XML character entities in place.
+static int extract_xml_tag(const char *start, const char *end,
+                           const char *open_tag, const char *close_tag,
+                           char *out, size_t out_sz) {
+  const char *a = strstr(start, open_tag);
+  if (!a || a >= end)
+    return -1;
+  a += strlen(open_tag);
+  const char *b = strstr(a, close_tag);
+  if (!b || b > end)
+    return -1;
+
+  size_t i = 0;
+  while (a < b && i + 1 < out_sz) {
+    if (*a == '&') {
+      if (strncmp(a, "&amp;", 5) == 0) {
+        out[i++] = '&';
+        a += 5;
+        continue;
+      } else if (strncmp(a, "&lt;", 4) == 0) {
+        out[i++] = '<';
+        a += 4;
+        continue;
+      } else if (strncmp(a, "&gt;", 4) == 0) {
+        out[i++] = '>';
+        a += 4;
+        continue;
+      } else if (strncmp(a, "&quot;", 6) == 0) {
+        out[i++] = '"';
+        a += 6;
+        continue;
+      } else if (strncmp(a, "&#39;", 5) == 0 || strncmp(a, "&apos;", 6) == 0) {
+        out[i++] = '\'';
+        a += (a[1] == '#') ? 5 : 6;
+        continue;
+      }
+    }
+    out[i++] = *a++;
+  }
+  out[i] = '\0';
+  return 0;
+}
+
+// Fetches the official Arch Linux News RSS feed and highlights any advisories
+// published since the system's last pacman upgrade (or within the last 14 days
+// if /var/log/pacman.log has no prior timestamp).
+static void check_arch_news(CURL *curl) {
+  time_t cutoff = last_pacman_upgrade_time();
+  if (cutoff <= 0)
+    cutoff = time(NULL) - 14 * 86400;
+
+  struct mem_buf resp = {malloc(1), 0};
+  if (!resp.data)
+    return;
+  resp.data[0] = '\0';
+
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "upgrade-alpm/2.5");
+  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 6L);
+  curl_easy_setopt(curl, CURLOPT_URL, "https://archlinux.org/feeds/news/");
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&resp);
+
+  if (curl_easy_perform(curl) != CURLE_OK) {
+    free(resp.data);
+    return; // Non-fatal if archlinux.org is unreachable
+  }
+
+  size_t fresh_news = 0;
+  const char *p = resp.data;
+  while ((p = strstr(p, "<item>")) != NULL) {
+    const char *item_end = strstr(p, "</item>");
+    if (!item_end)
+      break;
+
+    char title[256], link[256], pub[64];
+    if (extract_xml_tag(p, item_end, "<title>", "</title>", title,
+                        sizeof(title)) == 0 &&
+        extract_xml_tag(p, item_end, "<link>", "</link>", link, sizeof(link)) ==
+            0 &&
+        extract_xml_tag(p, item_end, "<pubDate>", "</pubDate>", pub,
+                        sizeof(pub)) == 0) {
+      time_t pub_t = parse_rfc2822_date(pub);
+      if (pub_t > cutoff) {
+        if (fresh_news == 0) {
+          printf(CLR_YELLOW
+                 "\n[!] Arch Linux News since your last upgrade:\n" CLR_RESET);
+        }
+        printf("    - %s\n      %s\n", title, link);
+        fresh_news++;
+      }
+    }
+    p = item_end + 7;
+  }
+
+  if (fresh_news == 0) {
+    printf(CLR_GREEN
+           "[✓] Arch Linux News: no new advisories since last upgrade.\n"
+           CLR_RESET);
+  }
+  free(resp.data);
 }
 
 // Returns the trimmed value of a "Key = Value" config line (modified in
@@ -646,17 +847,17 @@ static void run_alpm_telemetry(void) {
     }
   }
 
-  // Audit all collected foreign packages against the live AUR RPC v5 API
+  // Audit foreign packages against AUR RPC v5 and check Arch Linux News
   size_t aur_updates = 0;
-  if (foreign_count > 0) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    CURL *curl = curl_easy_init();
-    if (curl) {
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  CURL *curl = curl_easy_init();
+  if (curl) {
+    if (foreign_count > 0)
       aur_updates = audit_aur_packages(curl, foreign, foreign_count);
-      curl_easy_cleanup(curl);
-    }
-    curl_global_cleanup();
+    check_arch_news(curl);
+    curl_easy_cleanup(curl);
   }
+  curl_global_cleanup();
 
   clock_gettime(CLOCK_MONOTONIC, &t1);
   double elapsed_ms =
@@ -724,9 +925,9 @@ static void check_kernel_reboot(void) {
   }
 }
 
-// Scans /proc/<pid>/maps for processes readable by the current user that still
-// have deleted shared libraries (/usr/lib/*.so ... (deleted)) mapped in RAM
-// after an upgrade, deduplicating output by process name (/proc/<pid>/comm).
+// Scans /proc/<pid>/exe and /proc/<pid>/maps for processes that are still
+// running a deleted executable or holding deleted /usr/lib/*.so shared
+// libraries in RAM after an upgrade, deduplicating by /proc/<pid>/comm.
 static void check_stale_libs(void) {
   DIR *proc = opendir("/proc");
   if (!proc)
@@ -758,28 +959,45 @@ static void check_stale_libs(void) {
     if (pid <= 0 || pid == self)
       continue;
 
-    char maps_path[64];
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)pid);
-
-    FILE *fp = fopen(maps_path, "r");
-    if (!fp) {
-      if (errno == EACCES)
-        hidden++;
-      continue;
-    }
-
-    char line[1024];
     char deleted_lib[256] = "";
 
-    while (fgets(line, sizeof(line), fp)) {
-      const char *usr_lib = strstr(line, "/usr/lib/");
-      if (usr_lib && strstr(usr_lib, ".so") && strstr(usr_lib, "(deleted)")) {
-        snprintf(deleted_lib, sizeof(deleted_lib), "%s", usr_lib);
-        deleted_lib[strcspn(deleted_lib, " \t\n")] = '\0';
-        break;
+    // 1. Check whether the process's main executable binary itself was replaced
+    char exe_path[64], exe_buf[240];
+    snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", (int)pid);
+    ssize_t elen = readlink(exe_path, exe_buf, sizeof(exe_buf) - 1);
+    if (elen > 10) {
+      exe_buf[elen] = '\0';
+      if (strcmp(exe_buf + elen - 10, " (deleted)") == 0) {
+        exe_buf[elen - 10] = '\0';
+        snprintf(deleted_lib, sizeof(deleted_lib), "[exe] %s", exe_buf);
       }
     }
-    fclose(fp);
+
+    // 2. Otherwise inspect memory mappings for deleted shared libraries
+    if (deleted_lib[0] == '\0') {
+      char maps_path[64];
+      snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)pid);
+
+      FILE *fp = fopen(maps_path, "r");
+      if (!fp) {
+        if (errno == EACCES)
+          hidden++;
+        continue;
+      }
+
+      char line[1024];
+      while (fgets(line, sizeof(line), fp)) {
+        const char *usr_lib = strstr(line, "/usr/lib/");
+        if (!usr_lib)
+          usr_lib = strstr(line, "/lib/");
+        if (usr_lib && strstr(usr_lib, ".so") && strstr(usr_lib, "(deleted)")) {
+          snprintf(deleted_lib, sizeof(deleted_lib), "%s", usr_lib);
+          deleted_lib[strcspn(deleted_lib, " \t\n")] = '\0';
+          break;
+        }
+      }
+      fclose(fp);
+    }
 
     if (deleted_lib[0] != '\0') {
       char comm_path[64];
@@ -810,9 +1028,9 @@ static void check_stale_libs(void) {
       }
 
       if (stale_count == 0) {
-        printf(CLR_YELLOW "\n[!] %s processes holding deleted /usr/lib "
+        printf(CLR_YELLOW "\n[!] %s processes running deleted binaries or "
                           "shared libraries in RAM:\n" CLR_RESET,
-               as_root ? "All" : "User");
+               as_root ? "System/user" : "User");
       }
       printf("    - %-18s (PID %-6d) -> %s\n", comm, (int)pid, deleted_lib);
       stale_count++;
@@ -821,7 +1039,7 @@ static void check_stale_libs(void) {
   closedir(proc);
 
   if (stale_count == 0) {
-    printf(CLR_GREEN "[✓] No %sprocesses holding stale /usr/lib shared "
+    printf(CLR_GREEN "[✓] No %sprocesses holding stale binaries or shared "
                      "libraries.\n" CLR_RESET,
            as_root ? "" : "user ");
   }
@@ -915,54 +1133,649 @@ static int acquire_sudo(void) {
   return 0;
 }
 
-// pacman-only fallback for orphan removal (no yay/paru installed):
-// equivalent of `pacman -Qdtq | sudo pacman -Rns [--noconfirm] -`
-static void remove_orphans_pacman(int auto_yes) {
-  FILE *fp = popen("pacman -Qdtq 2>/dev/null", "r");
-  if (!fp)
+// Detects true orphaned dependencies via libalpm (`pacman -Qdtq` equivalent:
+// installed as a dependency and neither required nor optionally required by any
+// package). Skips spawning an external helper altogether when 0 orphans exist.
+static void sweep_orphans(const char *aur_helper, int auto_yes) {
+  alpm_errno_t err;
+  alpm_handle_t *handle = alpm_initialize("/", "/var/lib/pacman", &err);
+  if (!handle)
     return;
 
-  size_t cap = 16, n = 0;
-  char **args = malloc(cap * sizeof(char *));
-  if (!args) {
-    pclose(fp);
+  alpm_db_t *localdb = alpm_get_localdb(handle);
+  size_t cap = 16, count = 0;
+  char **orphans = malloc(cap * sizeof(char *));
+  if (!orphans) {
+    alpm_release(handle);
     return;
   }
-  args[n++] = (char *)"sudo";
-  args[n++] = (char *)"pacman";
-  args[n++] = (char *)"-Rns";
-  if (auto_yes)
-    args[n++] = (char *)"--noconfirm";
-  const size_t fixed = n;
 
-  char line[256];
-  while (fgets(line, sizeof(line), fp)) {
-    line[strcspn(line, "\r\n")] = '\0';
-    if (line[0] == '\0')
+  for (alpm_list_t *i = alpm_db_get_pkgcache(localdb); i != NULL;
+       i = alpm_list_next(i)) {
+    alpm_pkg_t *pkg = i->data;
+    if (alpm_pkg_get_reason(pkg) != ALPM_PKG_REASON_DEPEND)
       continue;
-    if (n + 2 > cap) { // Room for this name plus the NULL terminator
-      char **tmp = realloc(args, cap * 2 * sizeof(char *));
+
+    alpm_list_t *req = alpm_pkg_compute_requiredby(pkg);
+    if (req) {
+      FREELIST(req);
+      continue;
+    }
+    alpm_list_t *opt = alpm_pkg_compute_optionalfor(pkg);
+    if (opt) {
+      FREELIST(opt);
+      continue;
+    }
+
+    if (count == cap) {
+      char **tmp = realloc(orphans, cap * 2 * sizeof(char *));
       if (!tmp)
         break;
-      args = tmp;
+      orphans = tmp;
       cap *= 2;
     }
-    if (!(args[n] = strdup(line)))
-      break;
-    n++;
+    orphans[count] = strdup(alpm_pkg_get_name(pkg));
+    if (orphans[count])
+      count++;
   }
-  pclose(fp);
+  alpm_release(handle);
 
-  if (n == fixed) {
-    printf(CLR_GREEN "[✓] No orphaned packages.\n" CLR_RESET);
+  if (count == 0) {
+    printf(CLR_GREEN "[✓] No orphaned dependencies.\n" CLR_RESET);
+    free(orphans);
+    return;
+  }
+
+  printf(CLR_YELLOW "    Found %zu orphaned package(s):" CLR_RESET, count);
+  for (size_t i = 0; i < count; i++)
+    printf(" %s", orphans[i]);
+  printf("\n");
+
+  char *noconfirm = auto_yes ? "--noconfirm" : NULL;
+  if (aur_helper && strcmp(aur_helper, "yay") == 0) {
+    char *const cmd[] = {"yay", "-Yc", noconfirm, NULL};
+    run_cmd(cmd);
+  } else if (aur_helper && strcmp(aur_helper, "paru") == 0) {
+    char *const cmd[] = {"paru", "-c", noconfirm, NULL};
+    run_cmd(cmd);
   } else {
-    args[n] = NULL;
-    run_cmd(args);
+    char **args = malloc((count + 5) * sizeof(char *));
+    if (args) {
+      size_t n = 0;
+      args[n++] = "sudo";
+      args[n++] = "pacman";
+      args[n++] = "-Rns";
+      if (auto_yes)
+        args[n++] = "--noconfirm";
+      for (size_t i = 0; i < count; i++)
+        args[n++] = orphans[i];
+      args[n] = NULL;
+      run_cmd(args);
+      free(args);
+    }
   }
 
-  for (size_t i = fixed; i < n; i++)
-    free(args[i]);
-  free(args);
+  for (size_t i = 0; i < count; i++)
+    free(orphans[i]);
+  free(orphans);
+}
+
+// Removes leftover `download-XXXXXX` sandbox directories left behind by
+// interrupted Pacman 7 downloads when no db.lck is active.
+static void sweep_download_dirs(const char *parent, size_t *dirs_removed,
+                                unsigned long long *bytes_freed) {
+  DIR *d = opendir(parent);
+  if (!d)
+    return;
+
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (strncmp(ent->d_name, "download-", 9) != 0)
+      continue;
+
+    char sub[PATH_MAX];
+    if (snprintf(sub, sizeof(sub), "%s/%s", parent, ent->d_name) >=
+        (int)sizeof(sub))
+      continue;
+
+    struct stat st;
+    if (lstat(sub, &st) != 0 || !S_ISDIR(st.st_mode))
+      continue;
+
+    DIR *sd = opendir(sub);
+    if (sd) {
+      struct dirent *se;
+      while ((se = readdir(sd)) != NULL) {
+        if (strcmp(se->d_name, ".") == 0 || strcmp(se->d_name, "..") == 0)
+          continue;
+        char fp[PATH_MAX];
+        if (snprintf(fp, sizeof(fp), "%s/%s", sub, se->d_name) >=
+            (int)sizeof(fp))
+          continue;
+        struct stat fst;
+        if (lstat(fp, &fst) == 0 && !S_ISDIR(fst.st_mode)) {
+          if (unlink(fp) == 0 && S_ISREG(fst.st_mode))
+            *bytes_freed += (unsigned long long)fst.st_size;
+        }
+      }
+      closedir(sd);
+    }
+    if (rmdir(sub) == 0)
+      (*dirs_removed)++;
+  }
+  closedir(d);
+}
+
+struct cached_pkg {
+  char *filename;
+  char *pkgname;
+  char *ver;
+};
+
+static int cmp_cached_pkg(const void *a, const void *b) {
+  const struct cached_pkg *pa = (const struct cached_pkg *)a;
+  const struct cached_pkg *pb = (const struct cached_pkg *)b;
+  int c = strcmp(pa->pkgname, pb->pkgname);
+  if (c != 0)
+    return c;
+  // Sort newest version first within each package group
+  return alpm_pkg_vercmp(pb->ver, pa->ver);
+}
+
+// Parses `<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar*` into `out` (returns 0 on
+// match, -1 for non-package or `.sig`/`.part` files).
+static int parse_cached_pkg(const char *fname, struct cached_pkg *out) {
+  const char *ext = strstr(fname, ".pkg.tar");
+  if (!ext || ext == fname)
+    return -1;
+  size_t flen = strlen(fname);
+  if ((flen >= 4 && strcmp(fname + flen - 4, ".sig") == 0) ||
+      (flen >= 5 && strcmp(fname + flen - 5, ".part") == 0))
+    return -1;
+
+  // Locate the last 3 hyphens before `.pkg.tar`: -<pkgver>-<pkgrel>-<arch>
+  const char *h3 = NULL, *h2 = NULL, *h1 = NULL;
+  for (const char *p = ext - 1; p > fname; p--) {
+    if (*p == '-') {
+      if (!h3)
+        h3 = p;
+      else if (!h2)
+        h2 = p;
+      else {
+        h1 = p;
+        break;
+      }
+    }
+  }
+  if (!h1 || h1 == fname || h2 == h1 + 1 || h3 == h2 + 1)
+    return -1;
+
+  out->filename = strdup(fname);
+  out->pkgname = strndup(fname, (size_t)(h1 - fname));
+  size_t vlen = (size_t)(h3 - (h1 + 1));
+  out->ver = malloc(vlen + 1);
+  if (!out->filename || !out->pkgname || !out->ver) {
+    free(out->filename);
+    free(out->pkgname);
+    free(out->ver);
+    return -1;
+  }
+
+  // Decode URL-escaped '%3A' epochs back to ':' so alpm_pkg_vercmp() matches
+  size_t vi = 0;
+  for (const char *p = h1 + 1; p < h3;) {
+    if (p + 2 < h3 && p[0] == '%' && p[1] == '3' &&
+        (p[2] == 'A' || p[2] == 'a')) {
+      out->ver[vi++] = ':';
+      p += 3;
+    } else {
+      out->ver[vi++] = *p++;
+    }
+  }
+  out->ver[vi] = '\0';
+  return 0;
+}
+
+// Native replacement for `paccache -rk2` + `paccache -ruk0` + Pacman 7 stale
+// sandbox cleanup. Keeps the newest 2 versions of installed packages and drops
+// all cached archives for uninstalled packages.
+static void clean_pacman_cache(void) {
+  if (access("/var/lib/pacman/db.lck", F_OK) == 0) {
+    fprintf(stderr, CLR_YELLOW ":: Skipping cache trim: db.lck is held.\n"
+                               CLR_RESET);
+    return;
+  }
+
+  char cachedir[PATH_MAX] = "/var/cache/pacman/pkg";
+  FILE *cf = fopen("/etc/pacman.conf", "r");
+  if (cf) {
+    char line[512];
+    while (fgets(line, sizeof(line), cf)) {
+      char *p = line;
+      while (*p == ' ' || *p == '\t')
+        p++;
+      if (strncmp(p, "CacheDir", 8) == 0) {
+        char *v = conf_value(p);
+        if (v) {
+          size_t len = strlen(v);
+          while (len > 1 && v[len - 1] == '/')
+            v[--len] = '\0';
+          snprintf(cachedir, sizeof(cachedir), "%s", v);
+          break;
+        }
+      }
+    }
+    fclose(cf);
+  }
+
+  size_t dl_dirs = 0;
+  unsigned long long freed_bytes = 0;
+  sweep_download_dirs("/var/lib/pacman/sync", &dl_dirs, &freed_bytes);
+  sweep_download_dirs(cachedir, &dl_dirs, &freed_bytes);
+
+  alpm_errno_t err;
+  alpm_handle_t *handle = alpm_initialize("/", "/var/lib/pacman", &err);
+  if (!handle)
+    return;
+  alpm_db_t *localdb = alpm_get_localdb(handle);
+
+  DIR *d = opendir(cachedir);
+  if (!d) {
+    alpm_release(handle);
+    return;
+  }
+
+  size_t cap = 256, count = 0;
+  struct cached_pkg *items = malloc(cap * sizeof(struct cached_pkg));
+  if (!items) {
+    closedir(d);
+    alpm_release(handle);
+    return;
+  }
+
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (count == cap) {
+      struct cached_pkg *tmp =
+          realloc(items, cap * 2 * sizeof(struct cached_pkg));
+      if (!tmp)
+        break;
+      items = tmp;
+      cap *= 2;
+    }
+    if (parse_cached_pkg(ent->d_name, &items[count]) == 0)
+      count++;
+  }
+  closedir(d);
+
+  qsort(items, count, sizeof(struct cached_pkg), cmp_cached_pkg);
+
+  size_t removed_pkgs = 0;
+  for (size_t i = 0; i < count;) {
+    size_t j = i + 1;
+    while (j < count && strcmp(items[i].pkgname, items[j].pkgname) == 0)
+      j++;
+
+    size_t keep = (alpm_db_get_pkg(localdb, items[i].pkgname) != NULL) ? 2 : 0;
+    for (size_t k = i + keep; k < j; k++) {
+      char path[PATH_MAX];
+      if (snprintf(path, sizeof(path), "%s/%s", cachedir, items[k].filename) <
+          (int)sizeof(path)) {
+        struct stat st;
+        if (lstat(path, &st) == 0 && unlink(path) == 0) {
+          freed_bytes += (unsigned long long)st.st_size;
+          removed_pkgs++;
+        }
+      }
+      char sig[PATH_MAX];
+      if (snprintf(sig, sizeof(sig), "%s/%s.sig", cachedir, items[k].filename) <
+          (int)sizeof(sig)) {
+        struct stat st;
+        if (lstat(sig, &st) == 0 && unlink(sig) == 0)
+          freed_bytes += (unsigned long long)st.st_size;
+      }
+    }
+    i = j;
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    free(items[i].filename);
+    free(items[i].pkgname);
+    free(items[i].ver);
+  }
+  free(items);
+  alpm_release(handle);
+
+  if (removed_pkgs > 0) {
+    double mib = (double)freed_bytes / (1024.0 * 1024.0);
+    if (mib >= 1024.0) {
+      printf(CLR_GREEN "[✓] Pacman cache: removed %zu stale archive(s) "
+                       "(freed %.2f GiB).\n" CLR_RESET,
+             removed_pkgs, mib / 1024.0);
+    } else {
+      printf(CLR_GREEN "[✓] Pacman cache: removed %zu stale archive(s) "
+                       "(freed %.2f MiB).\n" CLR_RESET,
+             removed_pkgs, mib);
+    }
+  } else {
+    printf(CLR_GREEN
+           "[✓] Pacman cache already clean (kept last 2 versions).\n"
+           CLR_RESET);
+  }
+  if (dl_dirs > 0) {
+    printf(CLR_GREEN
+           "[✓] Swept %zu leftover pacman download-* temp dir(s).\n" CLR_RESET,
+           dl_dirs);
+  }
+}
+
+struct str_vec {
+  char **items;
+  size_t count;
+  size_t cap;
+};
+
+static void str_vec_add_unique(struct str_vec *v, const char *s) {
+  for (size_t i = 0; i < v->count; i++) {
+    if (strcmp(v->items[i], s) == 0)
+      return;
+  }
+  if (v->count == v->cap) {
+    size_t ncap = v->cap ? v->cap * 2 : 16;
+    char **tmp = realloc(v->items, ncap * sizeof(char *));
+    if (!tmp)
+      return;
+    v->items = tmp;
+    v->cap = ncap;
+  }
+  char *dup = strdup(s);
+  if (dup)
+    v->items[v->count++] = dup;
+}
+
+static int cmp_cstr_ptr(const void *a, const void *b) {
+  return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static void walk_etc_pacfiles(const char *dir, int depth, struct str_vec *out) {
+  if (depth > 12)
+    return;
+  DIR *d = opendir(dir);
+  if (!d)
+    return;
+
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+      continue;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) >=
+        (int)sizeof(path))
+      continue;
+
+    struct stat st;
+    if (lstat(path, &st) != 0)
+      continue;
+    if (S_ISDIR(st.st_mode)) {
+      walk_etc_pacfiles(path, depth + 1, out);
+    } else if (S_ISREG(st.st_mode)) {
+      size_t n = strlen(ent->d_name);
+      if ((n > 7 && strcmp(ent->d_name + n - 7, ".pacnew") == 0) ||
+          (n > 8 && strcmp(ent->d_name + n - 8, ".pacsave") == 0) ||
+          (n > 8 && strcmp(ent->d_name + n - 8, ".pacorig") == 0)) {
+        str_vec_add_unique(out, path);
+      }
+    }
+  }
+  closedir(d);
+}
+
+// Native replacement for `pacdiff -o`: checks every installed package's backup
+// array via libalpm AND walks /etc for .pacsave files from removed packages.
+static void scan_pacnew_files(void) {
+  struct str_vec found = {NULL, 0, 0};
+
+  alpm_errno_t err;
+  alpm_handle_t *handle = alpm_initialize("/", "/var/lib/pacman", &err);
+  if (handle) {
+    alpm_db_t *localdb = alpm_get_localdb(handle);
+    static const char *const exts[3] = {".pacnew", ".pacsave", ".pacorig"};
+
+    for (alpm_list_t *i = alpm_db_get_pkgcache(localdb); i != NULL;
+         i = alpm_list_next(i)) {
+      for (alpm_list_t *b = alpm_pkg_get_backup(i->data); b != NULL;
+           b = alpm_list_next(b)) {
+        const alpm_backup_t *bk = b->data;
+        if (!bk || !bk->name)
+          continue;
+        for (int e = 0; e < 3; e++) {
+          char path[PATH_MAX];
+          if (snprintf(path, sizeof(path), "/%s%s", bk->name, exts[e]) <
+              (int)sizeof(path)) {
+            struct stat st;
+            if (lstat(path, &st) == 0 && S_ISREG(st.st_mode))
+              str_vec_add_unique(&found, path);
+          }
+        }
+      }
+    }
+    alpm_release(handle);
+  }
+
+  walk_etc_pacfiles("/etc", 0, &found);
+
+  if (found.count == 0) {
+    printf(CLR_GREEN "[✓] No unmerged .pacnew / .pacsave files.\n" CLR_RESET);
+  } else {
+    qsort(found.items, found.count, sizeof(char *), cmp_cstr_ptr);
+    printf(CLR_YELLOW "[!] Unmerged config files requiring review (%zu):\n"
+                      CLR_RESET,
+           found.count);
+    for (size_t i = 0; i < found.count; i++) {
+      printf("    - %s\n", found.items[i]);
+      free(found.items[i]);
+    }
+  }
+  free(found.items);
+}
+
+// Checks both system-wide and per-user systemd managers for failed units
+static void check_systemd_health(void) {
+  char *const sys_ok[] = {"systemctl", "is-system-running", "--quiet", NULL};
+  char *const sys_fail[] = {"systemctl", "--failed", "--no-legend", "--plain",
+                            NULL};
+  int healthy = 1;
+
+  if (run_cmd(sys_ok) != 0) {
+    printf(CLR_YELLOW "[!] Degraded system systemd units:\n" CLR_RESET);
+    run_cmd(sys_fail);
+    healthy = 0;
+  }
+
+  const char *xdg = getenv("XDG_RUNTIME_DIR");
+  if (xdg && *xdg != '\0') {
+    char *const usr_ok[] = {"systemctl", "--user", "is-system-running",
+                            "--quiet", NULL};
+    char *const usr_fail[] = {"systemctl",   "--user",  "--failed",
+                              "--no-legend", "--plain", NULL};
+    if (run_cmd(usr_ok) != 0) {
+      printf(CLR_YELLOW "[!] Degraded user systemd units:\n" CLR_RESET);
+      run_cmd(usr_fail);
+      healthy = 0;
+    }
+  }
+
+  if (healthy) {
+    printf(CLR_GREEN "[✓] All systemd system & user services healthy.\n"
+                     CLR_RESET);
+  }
+}
+
+static size_t count_subdirs(const char *dir) {
+  DIR *d = opendir(dir);
+  if (!d)
+    return 0;
+  size_t n = 0;
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (ent->d_name[0] != '.')
+      n++;
+  }
+  closedir(d);
+  return n;
+}
+
+// Built-in native C system summary card (replaces external `fastfetch`)
+static void print_sys_summary(void) {
+  struct utsname uts;
+  if (uname(&uts) != 0)
+    return;
+
+  const char *user = "user";
+  struct passwd *pw = getpwuid(getuid());
+  if (pw && pw->pw_name && *pw->pw_name)
+    user = pw->pw_name;
+
+  // OS name from /etc/os-release
+  char os_name[256] = "Arch Linux";
+  FILE *os_fp = fopen("/etc/os-release", "r");
+  if (os_fp) {
+    char line[256];
+    while (fgets(line, sizeof(line), os_fp)) {
+      if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+        char *v = line + 12;
+        v[strcspn(v, "\r\n")] = '\0';
+        if (*v == '"') {
+          v++;
+          size_t l = strlen(v);
+          if (l > 0 && v[l - 1] == '"')
+            v[l - 1] = '\0';
+        }
+        if (*v != '\0')
+          snprintf(os_name, sizeof(os_name), "%s", v);
+        break;
+      }
+    }
+    fclose(os_fp);
+  }
+
+  // CPU model from /proc/cpuinfo
+  char cpu_model[256] = "Unknown CPU";
+  FILE *cpu_fp = fopen("/proc/cpuinfo", "r");
+  if (cpu_fp) {
+    char line[256];
+    while (fgets(line, sizeof(line), cpu_fp)) {
+      if (strncmp(line, "model name", 10) == 0 ||
+          strncmp(line, "Model", 5) == 0) {
+        char *colon = strchr(line, ':');
+        if (colon) {
+          colon++;
+          while (*colon == ' ' || *colon == '\t')
+            colon++;
+          colon[strcspn(colon, "\r\n")] = '\0';
+          if (*colon != '\0') {
+            snprintf(cpu_model, sizeof(cpu_model), "%s", colon);
+            break;
+          }
+        }
+      }
+    }
+    fclose(cpu_fp);
+  }
+  long threads = sysconf(_SC_NPROCESSORS_ONLN);
+
+  // Memory usage from /proc/meminfo
+  unsigned long long mem_total_kb = 0, mem_avail_kb = 0;
+  FILE *mem_fp = fopen("/proc/meminfo", "r");
+  if (mem_fp) {
+    char line[128];
+    while (fgets(line, sizeof(line), mem_fp)) {
+      sscanf(line, "MemTotal: %llu kB", &mem_total_kb);
+      sscanf(line, "MemAvailable: %llu kB", &mem_avail_kb);
+      if (mem_total_kb && mem_avail_kb)
+        break;
+    }
+    fclose(mem_fp);
+  }
+
+  // Uptime & load average via sysinfo()
+  struct sysinfo si;
+  long up_s = (sysinfo(&si) == 0) ? si.uptime : 0;
+  long days = up_s / 86400;
+  long hrs = (up_s % 86400) / 3600;
+  long mins = (up_s % 3600) / 60;
+  double load1 = (double)si.loads[0] / (double)(1 << SI_LOAD_SHIFT);
+  double load5 = (double)si.loads[1] / (double)(1 << SI_LOAD_SHIFT);
+
+  // Package counts (pacman via libalpm + Flatpak app dirs if present)
+  size_t pacman_pkgs = 0;
+  alpm_errno_t err;
+  alpm_handle_t *handle = alpm_initialize("/", "/var/lib/pacman", &err);
+  if (handle) {
+    pacman_pkgs =
+        alpm_list_count(alpm_db_get_pkgcache(alpm_get_localdb(handle)));
+    alpm_release(handle);
+  }
+  size_t flatpak_pkgs = count_subdirs("/var/lib/flatpak/app");
+  const char *home = getenv("HOME");
+  if (home && *home) {
+    char ufp[PATH_MAX];
+    if (snprintf(ufp, sizeof(ufp), "%s/.local/share/flatpak/app", home) <
+        (int)sizeof(ufp))
+      flatpak_pkgs += count_subdirs(ufp);
+  }
+
+  printf("\n" CLR_CYAN "   %s@%s" CLR_RESET "\n   ", user, uts.nodename);
+  size_t hlen = strlen(user) + 1 + strlen(uts.nodename);
+  for (size_t i = 0; i < hlen && i < 60; i++)
+    putchar('-');
+  putchar('\n');
+
+  printf("   " CLR_CYAN "%-10s" CLR_RESET " %s (%s)\n", "OS", os_name,
+         uts.machine);
+  printf("   " CLR_CYAN "%-10s" CLR_RESET " %s\n", "Kernel", uts.release);
+  if (days > 0) {
+    printf("   " CLR_CYAN "%-10s" CLR_RESET
+           " %ldd %ldh %ldm (load %.2f, %.2f)\n",
+           "Uptime", days, hrs, mins, load1, load5);
+  } else {
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %ldh %ldm (load %.2f, %.2f)\n",
+           "Uptime", hrs, mins, load1, load5);
+  }
+  if (threads > 0)
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %s (%ld threads)\n", "CPU",
+           cpu_model, threads);
+  else
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %s\n", "CPU", cpu_model);
+
+  if (mem_total_kb > 0) {
+    double tot = (double)mem_total_kb / (1024.0 * 1024.0);
+    double used = (double)(mem_total_kb - mem_avail_kb) / (1024.0 * 1024.0);
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %.2f / %.2f GiB (%.0f%%)\n",
+           "Memory", used, tot, (used / tot) * 100.0);
+  }
+
+  struct statvfs vfs;
+  if (statvfs("/", &vfs) == 0 && vfs.f_blocks > 0) {
+    double tot =
+        ((double)vfs.f_blocks * (double)vfs.f_frsize) / (1024.0 * 1024.0 * 1024.0);
+    double avail =
+        ((double)vfs.f_bavail * (double)vfs.f_frsize) / (1024.0 * 1024.0 * 1024.0);
+    double used = tot -
+                  ((double)vfs.f_bfree * (double)vfs.f_frsize) /
+                      (1024.0 * 1024.0 * 1024.0);
+    printf("   " CLR_CYAN "%-10s" CLR_RESET
+           " %.2f / %.2f GiB used (%.2f GiB free)\n",
+           "Disk (/)", used, tot, avail);
+  }
+
+  if (flatpak_pkgs > 0) {
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %zu (pacman), %zu (flatpak)\n",
+           "Packages", pacman_pkgs, flatpak_pkgs);
+  } else {
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %zu (pacman)\n", "Packages",
+           pacman_pkgs);
+  }
 }
 
 // Prints a numbered pipeline stage header, e.g. ":: [2/6] Updating ..."
@@ -972,11 +1785,11 @@ static void print_step(int *step, int total, const char *msg) {
 
 static void usage(const char *prog) {
   printf("Usage: %s [options]\n"
-         "One-stop Arch Linux maintenance: official repos + AUR (yay/paru) +\n"
-         "Flatpak + Snap upgrades, then orphan/cache cleanup and health "
+         "Zero-extra-dependency Arch Linux maintenance: official repos + AUR +\n"
+         "Flatpak + Snap upgrades, native cache/orphan cleanup, and health "
          "checks.\n\n"
-         "  -c, --check   Read-only report of pending repo/AUR updates "
-         "(no root needed)\n"
+         "  -c, --check   Read-only report of pending repo/AUR updates & Arch "
+         "News\n"
          "  -y, --yes     Unattended: auto-confirm every package manager "
          "prompt\n"
          "  -h, --help    Show this help\n\n"
@@ -988,13 +1801,17 @@ int main(int argc, char *argv[]) {
   int check_only = 0;
   int auto_yes = 0;
   int stale_libs_only = 0;
+  int clean_cache_only = 0;
+  int scan_pacnew_only = 0;
 
   // Parse CLI flags:
-  //   -c, --check : Run read-only ALPM + AUR telemetry and exit
-  //   -y, --yes   : Auto-confirm yay/paru/pacman/flatpak prompts (unattended)
-  //   -h, --help  : Show usage
-  //   --stale-libs: Only scan /proc for deleted shared libs (used internally
-  //                 via sudo so root-owned daemons are covered too)
+  //   -c, --check   : Run read-only ALPM + AUR + Arch News telemetry and exit
+  //   -y, --yes     : Auto-confirm yay/paru/pacman/flatpak prompts (unattended)
+  //   -h, --help    : Show usage
+  //   --clean-cache : Internal root helper for native pacman cache trimming
+  //   --scan-pacnew : Internal root helper for full /etc .pacnew/.pacsave scan
+  //   --stale-libs  : Internal root helper for system-wide /proc stale binary
+  //                   and library scan
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--check") == 0)
       check_only = 1;
@@ -1002,6 +1819,10 @@ int main(int argc, char *argv[]) {
       auto_yes = 1;
     else if (strcmp(argv[i], "--stale-libs") == 0)
       stale_libs_only = 1;
+    else if (strcmp(argv[i], "--clean-cache") == 0)
+      clean_cache_only = 1;
+    else if (strcmp(argv[i], "--scan-pacnew") == 0)
+      scan_pacnew_only = 1;
     else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       usage(argv[0]);
       return EXIT_SUCCESS;
@@ -1014,6 +1835,14 @@ int main(int argc, char *argv[]) {
 
   if (stale_libs_only) {
     check_stale_libs();
+    return EXIT_SUCCESS;
+  }
+  if (clean_cache_only) {
+    clean_pacman_cache();
+    return EXIT_SUCCESS;
+  }
+  if (scan_pacnew_only) {
+    scan_pacnew_files();
     return EXIT_SUCCESS;
   }
 
@@ -1047,15 +1876,12 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  // Detect which package managers/tools this system actually has, so the
-  // same binary works on any Arch-based install
+  // Detect optional package managers (everything else is built in natively)
   const char *aur_helper =
       have_cmd("yay") ? "yay" : (have_cmd("paru") ? "paru" : NULL);
   int has_flatpak = have_cmd("flatpak");
   int has_snap = have_cmd("snap");
-  int has_paccache = have_cmd("paccache"); // pacman-contrib
-  int has_pacdiff = have_cmd("pacdiff");   // pacman-contrib
-  int total_steps = 4 + has_flatpak + has_snap + has_pacdiff;
+  int total_steps = 5 + has_flatpak + has_snap;
   int step = 0;
 
   if (!have_cmd("sudo")) {
@@ -1071,14 +1897,17 @@ int main(int argc, char *argv[]) {
   struct timespec t_start, t_end;
   clock_gettime(CLOCK_MONOTONIC, &t_start);
 
+  char self_exe[PATH_MAX];
+  ssize_t self_len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+  if (self_len > 0)
+    self_exe[self_len] = '\0';
+
   // NULL here simply terminates the argv early when not running with -y
   char *noconfirm = auto_yes ? "--noconfirm" : NULL;
   char *fp_yes = auto_yes ? "-y" : NULL;
 
   char *const up_aur[] = {(char *)aur_helper, "-Syu", noconfirm, NULL};
   char *const up_pacman[] = {"sudo", "pacman", "-Syu", noconfirm, NULL};
-  char *const cln_yay[] = {"yay", "-Yc", noconfirm, NULL};
-  char *const cln_paru[] = {"paru", "-c", noconfirm, NULL};
   char *const fp_sys_up[] = {"sudo",     "flatpak", "update",
                              "--system", fp_yes,    NULL};
   char *const fp_usr_up[] = {"flatpak", "update", "--user", fp_yes, NULL};
@@ -1088,13 +1917,6 @@ int main(int argc, char *argv[]) {
   char *const fp_usr_cln[] = {"flatpak",  "uninstall", "--user",
                               "--unused", fp_yes,      NULL};
   char *const snap_up[] = {"sudo", "snap", "refresh", NULL};
-  char *const paccache[] = {"sudo", "paccache", "-rk2", NULL};
-  char *const paccache_un[] = {"sudo", "paccache", "-ruk0", NULL};
-  char *const pacdiff[] = {"pacdiff", "-o", NULL};
-  char *const sysok[] = {"systemctl", "is-system-running", "--quiet", NULL};
-  char *const sysfail[] = {"systemctl", "--failed", "--no-legend", "--plain",
-                           NULL};
-  char *const fetch[] = {"fastfetch", NULL};
 
   if (aur_helper) {
     print_step(&step, total_steps,
@@ -1113,8 +1935,6 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  sync();
-
   if (has_flatpak) {
     print_step(&step, total_steps, "Updating Flatpak apps & runtimes...");
     if (run_cmd(fp_sys_up) != 0 || run_cmd(fp_usr_up) != 0)
@@ -1132,58 +1952,47 @@ int main(int argc, char *argv[]) {
   }
 
   print_step(&step, total_steps, "Sweeping orphaned dependencies...");
-  if (aur_helper && strcmp(aur_helper, "yay") == 0)
-    run_cmd(cln_yay);
-  else if (aur_helper)
-    run_cmd(cln_paru);
-  else
-    remove_orphans_pacman(auto_yes);
+  sweep_orphans(aur_helper, auto_yes);
 
   print_step(&step, total_steps,
              has_flatpak ? "Cleaning caches (pacman: keep last 2 versions, "
                            "drop uninstalled; unused Flatpak runtimes)..."
                          : "Cleaning caches (pacman: keep last 2 versions, "
                            "drop uninstalled)...");
-  if (has_paccache) {
-    run_cmd(paccache);
-    run_cmd(paccache_un);
+  if (self_len > 0) {
+    char *const sudo_cache[] = {"sudo", self_exe, "--clean-cache", NULL};
+    if (run_cmd(sudo_cache) != 0)
+      clean_pacman_cache();
   } else {
-    printf(CLR_MAGENTA "    paccache not found — install 'pacman-contrib' to "
-                       "trim the package cache.\n" CLR_RESET);
+    clean_pacman_cache();
   }
   if (has_flatpak) {
     run_cmd(fp_sys_cln);
     run_cmd(fp_usr_cln);
   }
 
-  if (has_pacdiff) {
-    print_step(&step, total_steps,
-               "Scanning for unmerged .pacnew / .pacsave files...");
-    run_cmd(pacdiff);
-  }
-
-  print_step(&step, total_steps, "Checking for degraded systemd services...");
-  if (run_cmd(sysok) == 0) {
-    printf(CLR_GREEN "[✓] All systemd services healthy.\n" CLR_RESET);
+  print_step(&step, total_steps,
+             "Scanning for unmerged .pacnew / .pacsave files...");
+  if (self_len > 0) {
+    char *const sudo_pacnew[] = {"sudo", self_exe, "--scan-pacnew", NULL};
+    if (run_cmd(sudo_pacnew) != 0)
+      scan_pacnew_files();
   } else {
-    run_cmd(sysfail);
+    scan_pacnew_files();
   }
 
-  if (have_cmd("fastfetch")) {
-    printf("\n");
-    run_cmd(fetch);
-  }
+  print_step(&step, total_steps,
+             "Checking systemd system & user service health...");
+  check_systemd_health();
+
+  print_sys_summary();
 
   check_kernel_reboot();
 
-  // Re-run the stale library scan as root so system daemons (sshd, systemd-*,
-  // dbus, ...) are covered. sudo reuses the credentials kept alive since
-  // acquire_sudo(); fall back to the unprivileged user-only scan otherwise.
-  char self_exe[PATH_MAX];
-  ssize_t self_len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+  // Re-run the stale binary/library scan as root so system daemons (sshd,
+  // systemd-*, dbus, ...) are covered too.
   int scanned_as_root = 0;
   if (self_len > 0) {
-    self_exe[self_len] = '\0';
     char *const sudo_scan[] = {"sudo", self_exe, "--stale-libs", NULL};
     scanned_as_root = (run_cmd(sudo_scan) == 0);
   }

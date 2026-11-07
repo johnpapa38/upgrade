@@ -9,6 +9,7 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
 - **Pre-upgrade report, no root needed**
   - Downloads fresh copies of the sync databases into a private folder you own (`/tmp/upgrade-db-<uid>`). Your system's pacman databases are never touched.
   - Lists pending repo updates and checks every foreign package against the AUR RPC v5 API.
+  - Checks the official **Arch Linux News** feed (`archlinux.org/feeds/news/`) and warns if any advisory was posted since your last upgrade.
   - Flags foreign packages that are no longer in the AUR.
   - Respects `IgnorePkg` / `IgnoreGroup` from `/etc/pacman.conf`.
 - **Asks for sudo once**
@@ -19,16 +20,17 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
   - Repo + AUR via `yay` or `paru`, or `sudo pacman -Syu` if neither is installed
   - Flatpak (system and user installations)
   - Snap
-- **Cleans up after**
-  - Removes orphaned dependencies
-  - Trims the pacman cache (keeps the last 2 versions and removes cached packages that are no longer installed)
+- **Cleans up natively (no `pacman-contrib` needed)**
+  - Detects orphaned dependencies directly via `libalpm` (skips cleanup altogether when 0 orphans exist)
+  - Trims the pacman cache in C using `alpm_pkg_vercmp()` (keeps the last 2 versions of installed packages, drops cached tarballs for uninstalled packages, and sweeps leftover `download-*` sandbox folders)
   - Removes unused Flatpak runtimes
-- **Checks system health**
+- **Checks system health & prints a built-in C summary (no `fastfetch` needed)**
   - Pre-flight checks: free disk space on `/`, the package cache and `/boot`, and whether the pacman database is locked
-  - Lists unmerged `.pacnew` / `.pacsave` files
-  - Reports failed systemd units
+  - Native `.pacnew` / `.pacsave` / `.pacorig` scanner via `libalpm` backup metadata + `/etc` walk
+  - Checks both system-wide and `--user` systemd managers for failed services
+  - Built-in C system summary card (OS, kernel, uptime + load, CPU, RAM, `/` disk, package counts)
   - Warns if the kernel was upgraded and a reboot is due
-  - Lists processes (including root daemons) still running deleted libraries, which should be restarted
+  - Lists processes (including root daemons) running a deleted executable or holding deleted shared libraries in RAM
 
 ## Requirements
 
@@ -40,16 +42,14 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
 
 | Optional | Enables |
 |---|---|
-| `yay` or `paru` | AUR upgrades and orphan cleanup through the helper |
+| `yay` or `paru` | AUR upgrades |
 | `flatpak` | Flatpak update + unused runtime cleanup |
 | `snap` | Snap refresh |
-| `pacman-contrib` | `paccache` cache trimming and `pacdiff` |
-| `fastfetch` | System summary at the end |
 
 ## Build & install
 
 ```sh
-sudo pacman -S --needed base-devel pacman-contrib
+sudo pacman -S --needed base-devel
 git clone https://github.com/johnpapa38/upgrade.git
 cd upgrade
 make
@@ -84,9 +84,20 @@ Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR hel
 :: [4/7] Sweeping orphaned dependencies...
 :: [5/7] Cleaning caches (pacman: keep last 2 versions, drop uninstalled; unused Flatpak runtimes)...
 :: [6/7] Scanning for unmerged .pacnew / .pacsave files...
-:: [7/7] Checking for degraded systemd services...
+:: [7/7] Checking systemd system & user service health...
+
+   user@arch
+   ---------
+   OS         Arch Linux (x86_64)
+   Kernel     6.x.y-arch1-1
+   Uptime     5h 12m (load 0.42, 0.38)
+   CPU        AMD Ryzen ... (16 threads)
+   Memory     4.10 / 31.20 GiB (13%)
+   Disk (/)   48.20 / 500.00 GiB used (426.30 GiB free)
+   Packages   1120 (pacman), 14 (flatpak)
+
 [✓] Kernel modules intact (6.x.y-arch1-1) — no immediate reboot required.
-[✓] No processes holding stale /usr/lib shared libraries.
+[✓] No processes holding stale binaries or shared libraries.
 ```
 
 Steps for tools you don't have installed are skipped automatically.

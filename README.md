@@ -24,12 +24,17 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
   - Detects orphaned dependencies directly via `libalpm` (skips cleanup altogether when 0 orphans exist)
   - Trims both the pacman cache and `~/.cache/yay` / `~/.cache/paru/clone` built `.pkg.tar*` archives in C using `alpm_pkg_vercmp()` (keeps the last 2 versions of installed packages, drops cached tarballs for uninstalled packages, sweeps leftover `download-*` sandbox folders, and leaves `PKGBUILD`s / git clones untouched)
   - Removes unused Flatpak runtimes
+- **Pre-upgrade snapshots & package consistency**
+  - Creates a rollback snapshot before package transactions via `snapper` or `timeshift` (or integrates automatically with `snap-pac` ALPM hooks)
+  - Rebuild detection for foreign/AUR packages linked against upgraded libraries (`checkrebuild` / `rebuild-detector`)
+  - Upgradable vulnerability and CVE audit via `arch-audit`
 - **Checks system health & prints a built-in C summary (no `fastfetch` needed)**
   - Pre-flight checks: free disk space on `/`, the package cache, and `/boot` / `/efi` / `/boot/efi`, whether any `/etc/fstab` boot/ESP partition is unmounted or read-only (`ro`), and whether the pacman database is locked
   - Local package database consistency verification (`pacman -Dkq`) and DKMS kernel module build audit (`dkms status`, when installed)
   - Native `.pacnew` / `.pacsave` / `.pacorig` scanner via `libalpm` backup metadata + `/etc` walk
   - Configuration-drift & shadowing audit: flags unmanaged binaries in `/usr/local/bin` or `~/.local/bin` that shadow `/usr/bin` packages, custom `/etc/systemd/system/*.service` copies masking package units, and dangling `.wants` symlinks
   - Checks both system-wide and `--user` systemd managers for failed and crash-looping (`auto-restart`) services — printing a root-cause trace (`Unit`, `Exec`, filtered `journalctl` error log, plain-English `Why`, and exact `Fix` command) instead of bare unit names — plus current-boot coredump summary (`coredumpctl`) and boot timing (`systemd-analyze`)
+  - Deep hardware health audit: SMART telemetry & wear/temperature for internal NVMe/SATA disks (`smartctl`), EDAC RAM ECC errors, DMI DIMM inventory vs kernel usable memory (`dmidecode`), and storage I/O, filesystem corruption, MCE, or OOM events from the kernel log (`journalctl -k`)
   - Built-in C system summary card (OS, kernel, uptime + load, CPU, RAM, `/` disk, package counts)
   - Warns if the kernel was upgraded and a reboot is due
   - Lists processes (including root daemons) running a deleted executable or holding deleted shared libraries in RAM
@@ -47,6 +52,12 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
 | `yay` or `paru` | AUR upgrades |
 | `flatpak` | Flatpak update + unused runtime cleanup |
 | `snap` | Snap refresh |
+| `smartmontools` (`smartctl`) | NVMe / SATA SMART disk health & wear check |
+| `dmidecode` | Installed DIMM capacity vs usable RAM check |
+| `arch-audit` | Upgradable CVE vulnerability audit |
+| `rebuild-detector` (`checkrebuild`) | Foreign/AUR library rebuild check |
+| `snapper`, `snap-pac`, or `timeshift` | Pre-upgrade rollback snapshots |
+| `fwupd` (`fwupdmgr`) | LVFS device firmware update check |
 
 ## Build & install
 
@@ -65,7 +76,9 @@ Uninstall with `sudo make uninstall`. Change the install location with `PREFIX`,
 ```sh
 up               # (or `upgrade`) full update + cleanup (interactive prompts)
 up -y            # unattended: auto-confirm prompts + conflict replacements
-up -c            # read-only update, package DB, DKMS, service, boot & kernel report
+up -c            # read-only update, package DB, DKMS, service, boot & hardware report
+up --hw          # quick standalone hardware health (SMART, RAM, thermals, kernel) & summary
+up -v            # version
 up -h            # help
 ```
 

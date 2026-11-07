@@ -1,0 +1,10 @@
+# Build output
+/upgrade
+*.o
+
+# Editor / tooling
+.vscode/
+.idea/
+*.swp
+compile_commands.json
+.cache/

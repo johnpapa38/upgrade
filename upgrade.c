@@ -47,6 +47,7 @@ struct foreign_pkg {
   uint8_t in_aur;      // Set to 1 once confirmed present in AUR RPC results
   uint8_t ignored;     // Set to 1 if matched by IgnorePkg/IgnoreGroup
   uint8_t out_of_date; // Set to 1 if OutOfDate is non-null in AUR RPC
+  uint8_t orphaned;    // Set to 1 if AUR RPC reports Maintainer: null
 };
 
 // Forks and executes an external command, waiting for it to finish.
@@ -82,6 +83,89 @@ static int run_cmd(char *const argv[]) {
       return -2;
   }
   return -1;
+}
+
+// Executes `argv`, capturing stdout into `buf` (null-terminated) while routing
+// stderr to /dev/null so diagnostic probes stay quiet when optional daemons or
+// user buses are unavailable. Returns bytes captured (>= 0), or -1 on error.
+static ssize_t capture_cmd_output(char *const argv[], char *buf, size_t buf_sz,
+                                  int *exit_code) {
+  if (buf_sz == 0)
+    return -1;
+  buf[0] = '\0';
+  if (exit_code)
+    *exit_code = -1;
+
+  int pfd[2];
+  if (pipe(pfd) != 0)
+    return -1;
+
+  fflush(NULL);
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pfd[0]);
+    close(pfd[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    close(pfd[0]);
+    dup2(pfd[1], STDOUT_FILENO);
+    if (pfd[1] > STDOUT_FILENO)
+      close(pfd[1]);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDERR_FILENO);
+      if (devnull > STDERR_FILENO)
+        close(devnull);
+    }
+    execvp(argv[0], argv);
+    _exit(127);
+  }
+
+  close(pfd[1]);
+  size_t total = 0;
+  char drain[512];
+  for (;;) {
+    ssize_t n;
+    if (total + 1 < buf_sz)
+      n = read(pfd[0], buf + total, buf_sz - 1 - total);
+    else
+      n = read(pfd[0], drain, sizeof(drain));
+    if (n > 0) {
+      if (total + 1 < buf_sz)
+        total += (size_t)n;
+    } else if (n == 0) {
+      break;
+    } else if (errno != EINTR) {
+      break;
+    }
+  }
+  buf[total] = '\0';
+  close(pfd[0]);
+
+  int status;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR)
+      return -1;
+  }
+  if (exit_code && WIFEXITED(status))
+    *exit_code = WEXITSTATUS(status);
+  return (ssize_t)total;
+}
+
+static void print_indented_lines(const char *text) {
+  const char *p = text;
+  while (*p != '\0') {
+    const char *nl = strchr(p, '\n');
+    size_t len = nl ? (size_t)(nl - p) : strlen(p);
+    if (len > 0 && p[len - 1] == '\r')
+      len--;
+    if (len > 0)
+      printf("    %.*s\n", (int)len, p);
+    if (!nl)
+      break;
+    p = nl + 1;
+  }
 }
 
 // libcurl write callback: appends incoming HTTP response chunks into a
@@ -255,10 +339,30 @@ static size_t audit_aur_packages(CURL *curl, struct foreign_pkg *pkgs,
                 is_ood = 1;
             }
 
+            // AUR uses a JSON null Maintainer field for orphaned packages.
+            const char *maint = strstr(obj_start, "\"Maintainer\"");
+            int is_orphaned = 0;
+            if (maint && maint < p) {
+              maint += strlen("\"Maintainer\"");
+              while (maint < p && (*maint == ' ' || *maint == '\t' ||
+                                   *maint == '\r' || *maint == '\n'))
+                maint++;
+              if (maint < p && *maint == ':') {
+                maint++;
+                while (maint < p && (*maint == ' ' || *maint == '\t' ||
+                                     *maint == '\r' || *maint == '\n'))
+                  maint++;
+                if (maint + 4 <= p && strncmp(maint, "null", 4) == 0 &&
+                    (maint + 4 == p || !isalnum((unsigned char)maint[4])))
+                  is_orphaned = 1;
+              }
+            }
+
             for (size_t i = batch_start; i < batch_end; i++) {
               if (strcmp(pkgs[i].name, pkg_name) == 0) {
                 pkgs[i].in_aur = 1;
                 pkgs[i].out_of_date = (uint8_t)is_ood;
+                pkgs[i].orphaned = (uint8_t)is_orphaned;
                 if (!pkgs[i].ignored &&
                     alpm_pkg_vercmp(aur_ver, pkgs[i].ver) > 0) {
                   if (aur_updates == 0) {
@@ -296,6 +400,20 @@ static size_t audit_aur_packages(CURL *curl, struct foreign_pkg *pkgs,
   }
   if (flagged_ood > 0)
     printf("\n");
+
+  // AUR packages with no maintainer can remain unpatched until someone adopts
+  // them. This is a maintenance warning, not proof that the package is unsafe.
+  size_t orphaned_aur = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (pkgs[i].in_aur && pkgs[i].orphaned) {
+      if (orphaned_aur == 0) {
+        printf(CLR_YELLOW "\n[!] Orphaned AUR Packages (no maintainer):\n"
+                         CLR_RESET);
+      }
+      printf("    - %-28s (%s)\n", pkgs[i].name, pkgs[i].ver);
+      orphaned_aur++;
+    }
+  }
 
   // Any foreign package still marked in_aur == 0 was not returned by AUR RPC
   size_t unmaintained = 0;
@@ -882,6 +1000,7 @@ static void run_alpm_telemetry(int check_only, int has_aur_helper) {
       foreign[foreign_count].ignored =
           alpm_pkg_should_ignore(handle, local_pkg) ? 1 : 0;
       foreign[foreign_count].out_of_date = 0;
+      foreign[foreign_count].orphaned = 0;
       foreign_count++;
     } else if (check_only) {
       // Official repo package -> compare live sync DB version vs installed
@@ -1125,6 +1244,274 @@ static int have_cmd(const char *name) {
       return 0;
     p = colon + 1;
   }
+}
+
+// Runs pacman's native local-database consistency audit (`pacman -Dkq`), which
+// checks dependency satisfaction, package conflicts, required database files,
+// and duplicate file ownership. Read-only and does not need root.
+static void check_package_database(void) {
+  if (!have_cmd("pacman")) {
+    printf(CLR_YELLOW "[!] Package database check skipped: pacman not found.\n"
+                      CLR_RESET);
+    return;
+  }
+
+  if (access("/var/lib/pacman/db.lck", F_OK) == 0) {
+    printf(CLR_YELLOW "[!] Package database check skipped: pacman database is "
+                      "locked.\n" CLR_RESET);
+    return;
+  }
+
+  char *const cmd[] = {"pacman", "-Dkq", NULL};
+  int rc = run_cmd(cmd);
+  if (rc == 0) {
+    printf(CLR_GREEN "[✓] Local package database consistency check passed.\n"
+                     CLR_RESET);
+  } else if (rc == -2) {
+    printf(CLR_YELLOW "[!] Package database check interrupted.\n" CLR_RESET);
+  } else {
+    printf(CLR_RED "[!] Package database check reported problems; review the "
+                   "pacman output above.\n" CLR_RESET);
+  }
+}
+
+// Audits registered DKMS kernel module builds (when `dkms` is installed).
+// Pacman hooks do not fail the transaction when a DKMS module fails to build
+// against a newly installed kernel, so verifying `: installed` catches broken
+// out-of-tree drivers before rebooting.
+static void check_dkms_status(void) {
+  if (!have_cmd("dkms"))
+    return;
+
+  char buf[8192];
+  int rc = -1;
+  if (capture_cmd_output((char *const[]){"dkms", "status", NULL}, buf,
+                         sizeof(buf), &rc) < 0)
+    return;
+
+  size_t total = 0, broken = 0;
+  const char *p = buf;
+  while (*p != '\0') {
+    const char *nl = strchr(p, '\n');
+    size_t len = nl ? (size_t)(nl - p) : strlen(p);
+    if (len > 0) {
+      total++;
+      // Check whether this line reports `: installed`
+      int ok = 0;
+      for (size_t i = 0; i + 11 <= len; i++) {
+        if (memcmp(p + i, ": installed", 11) == 0) {
+          ok = 1;
+          break;
+        }
+      }
+      if (!ok)
+        broken++;
+    }
+    if (!nl)
+      break;
+    p = nl + 1;
+  }
+
+  if (total == 0 && rc == 0)
+    return;
+
+  if (rc != 0 || broken > 0) {
+    printf(CLR_YELLOW "[!] Incomplete or broken DKMS kernel module builds:\n"
+                      CLR_RESET);
+    print_indented_lines(buf);
+  } else {
+    printf(CLR_GREEN "[✓] DKMS modules healthy (%zu installed).\n" CLR_RESET,
+           total);
+  }
+}
+
+// Returns 1 if `opt` appears as an exact comma-separated token in `csv`.
+static int has_csv_opt(const char *csv, const char *opt) {
+  size_t olen = strlen(opt);
+  const char *p = csv;
+  while (*p != '\0') {
+    const char *comma = strchr(p, ',');
+    size_t len = comma ? (size_t)(comma - p) : strlen(p);
+    if (len == olen && strncmp(p, opt, olen) == 0)
+      return 1;
+    if (!comma)
+      break;
+    p = comma + 1;
+  }
+  return 0;
+}
+
+// Checks /proc/self/mountinfo (after stat'ing `target` to trigger any
+// x-systemd.automount autofs unit) to determine whether `target` has a real
+// filesystem mounted on it and whether that mount is read-only (`ro`).
+static void inspect_mountpoint(const char *target, int *is_mounted,
+                               int *is_ro) {
+  *is_mounted = 0;
+  *is_ro = 0;
+
+  struct stat st;
+  (void)stat(target, &st); // Trigger autofs if configured
+
+  FILE *fp = fopen("/proc/self/mountinfo", "r");
+  if (!fp)
+    return;
+
+  char line[1024];
+  while (fgets(line, sizeof(line), fp)) {
+    char mnt[512], opts[256], fstype[64];
+    if (sscanf(line, "%*s %*s %*s %*s %511s %255s", mnt, opts) != 2)
+      continue;
+    if (strcmp(mnt, target) != 0)
+      continue;
+    const char *sep = strstr(line, " - ");
+    if (!sep || sscanf(sep + 3, "%63s", fstype) != 1)
+      continue;
+    if (strcmp(fstype, "autofs") == 0)
+      continue;
+
+    *is_mounted = 1;
+    *is_ro = has_csv_opt(opts, "ro");
+  }
+  fclose(fp);
+}
+
+// Verifies that any /boot, /efi, or /boot/efi partition listed in /etc/fstab
+// (without `noauto`) is actually mounted before kernel/initramfs upgrades can
+// write to an unmounted directory on `/`, and checks that active boot/ESP
+// mounts are writable (`rw`) with at least 0.15 GiB free.
+static int check_boot_mounts(int check_only) {
+  int failed = 0;
+
+  FILE *fp = fopen("/etc/fstab", "r");
+  if (fp) {
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+      char *p = line;
+      while (*p == ' ' || *p == '\t')
+        p++;
+      if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0')
+        continue;
+
+      char spec[256], mnt[256], fstype[64], opts[256];
+      if (sscanf(p, "%255s %255s %63s %255s", spec, mnt, fstype, opts) < 4)
+        continue;
+      size_t mlen = strlen(mnt);
+      while (mlen > 1 && mnt[mlen - 1] == '/')
+        mnt[--mlen] = '\0';
+
+      if (strcmp(mnt, "/boot") != 0 && strcmp(mnt, "/efi") != 0 &&
+          strcmp(mnt, "/boot/efi") != 0)
+        continue;
+      if (has_csv_opt(opts, "noauto"))
+        continue;
+
+      int mounted = 0, ro = 0;
+      inspect_mountpoint(mnt, &mounted, &ro);
+      if (!mounted) {
+        if (check_only) {
+          printf(CLR_RED "[!] Boot/ESP partition '%s' is in /etc/fstab but NOT "
+                         "mounted!\n" CLR_RESET,
+                 mnt);
+        } else {
+          fprintf(stderr,
+                  CLR_RED ":: Error: Boot/ESP partition '%s' is in /etc/fstab "
+                          "but NOT mounted!\n"
+                          "   Mount '%s' before upgrading so kernel/initramfs "
+                          "files land on the ESP.\n" CLR_RESET,
+                  mnt, mnt);
+        }
+        failed = 1;
+      }
+    }
+    fclose(fp);
+  }
+
+  static const char *const candidates[3] = {"/boot", "/efi", "/boot/efi"};
+  int any_separate_mount = 0;
+  for (int i = 0; i < 3; i++) {
+    int mounted = 0, ro = 0;
+    inspect_mountpoint(candidates[i], &mounted, &ro);
+    if (!mounted)
+      continue;
+    any_separate_mount = 1;
+
+    if (ro) {
+      if (check_only) {
+        printf(CLR_RED "[!] Boot/ESP mount '%s' is mounted read-only (ro)!\n"
+                       CLR_RESET,
+               candidates[i]);
+      } else {
+        fprintf(stderr,
+                CLR_RED ":: Error: Boot/ESP mount '%s' is mounted read-only "
+                        "(ro)!\n" CLR_RESET,
+                candidates[i]);
+      }
+      failed = 1;
+      continue;
+    }
+
+    if (check_only) {
+      struct statvfs vfs;
+      if (statvfs(candidates[i], &vfs) == 0) {
+        double free_gib = ((double)vfs.f_bavail * (double)vfs.f_frsize) /
+                          (1024.0 * 1024.0 * 1024.0);
+        if (free_gib < 0.15) {
+          printf(CLR_RED "[!] Low free space on '%s': %.2f GiB available "
+                         "(need >= 0.15 GiB)!\n" CLR_RESET,
+                 candidates[i], free_gib);
+          failed = 1;
+        } else {
+          printf(CLR_GREEN "[✓] Boot/ESP mount '%s': mounted rw (%.2f GiB "
+                           "available).\n" CLR_RESET,
+                 candidates[i], free_gib);
+        }
+      } else {
+        printf(CLR_GREEN "[✓] Boot/ESP mount '%s': mounted rw.\n" CLR_RESET,
+               candidates[i]);
+      }
+    } else {
+      struct statvfs probe;
+      if (statvfs(candidates[i], &probe) != 0 && errno == EACCES &&
+          geteuid() != 0)
+        continue;
+      if (check_disk_space(candidates[i], 0.15) != 0)
+        failed = 1;
+    }
+  }
+
+  // Single-partition layout where /boot lives directly on `/`
+  if (!any_separate_mount && !check_only && access("/boot", F_OK) == 0) {
+    if (check_disk_space("/boot", 0.15) != 0)
+      failed = 1;
+  }
+
+  return failed ? -1 : 0;
+}
+
+// Reports the previous boot's total startup time and its critical dependency
+// chain. This is diagnostic only: it does not restart or alter any units.
+static void check_boot_performance(void) {
+  if (access("/run/systemd/system", F_OK) != 0)
+    return;
+  if (!have_cmd("systemd-analyze")) {
+    printf(CLR_MAGENTA "[i] Boot analysis unavailable: systemd-analyze not "
+                       "installed.\n" CLR_RESET);
+    return;
+  }
+
+  printf(CLR_CYAN "\n:: Last boot timing...\n" CLR_RESET);
+  char *const time_cmd[] = {"systemd-analyze", "--no-pager", "time", NULL};
+  if (run_cmd(time_cmd) != 0) {
+    printf(CLR_YELLOW "[!] Could not read systemd boot timing.\n" CLR_RESET);
+    return;
+  }
+
+  printf(CLR_CYAN "\n:: Last boot critical chain...\n" CLR_RESET);
+  char *const chain_cmd[] = {"systemd-analyze", "--no-pager",
+                             "critical-chain", NULL};
+  if (run_cmd(chain_cmd) != 0)
+    printf(CLR_YELLOW "[!] Could not read the systemd critical boot chain.\n"
+                      CLR_RESET);
 }
 
 // PID of the background sudo keep-alive child (-1 when not running)
@@ -1521,6 +1908,170 @@ static void clean_pacman_cache(void) {
   }
 }
 
+// Trims built `.pkg.tar*` archives inside ~/.cache/yay/* and
+// ~/.cache/paru/clone/* using the same retention policy as clean_pacman_cache()
+// (keep newest 2 versions of installed packages, drop uninstalled). Leaves
+// PKGBUILDs, git clones, and source files untouched.
+static void clean_aur_cache(void) {
+  const char *xdg = getenv("XDG_CACHE_HOME");
+  const char *home = getenv("HOME");
+  char cache_base[PATH_MAX];
+
+  if (xdg && xdg[0] == '/') {
+    if (snprintf(cache_base, sizeof(cache_base), "%s", xdg) >=
+        (int)sizeof(cache_base))
+      return;
+  } else if (home && home[0] == '/') {
+    if (snprintf(cache_base, sizeof(cache_base), "%s/.cache", home) >=
+        (int)sizeof(cache_base))
+      return;
+  } else {
+    return;
+  }
+
+  static const char *const rel_roots[2] = {"yay", "paru/clone"};
+  char roots[2][PATH_MAX];
+  int root_count = 0;
+  for (int r = 0; r < 2; r++) {
+    char cand[PATH_MAX];
+    struct stat st;
+    if (snprintf(cand, sizeof(cand), "%s/%s", cache_base, rel_roots[r]) <
+            (int)sizeof(cand) &&
+        lstat(cand, &st) == 0 && S_ISDIR(st.st_mode)) {
+      snprintf(roots[root_count++], PATH_MAX, "%s", cand);
+    }
+  }
+  if (root_count == 0)
+    return;
+
+  alpm_errno_t err;
+  alpm_handle_t *handle = alpm_initialize("/", "/var/lib/pacman", &err);
+  if (!handle)
+    return;
+  alpm_db_t *localdb = alpm_get_localdb(handle);
+
+  size_t cap = 128, count = 0;
+  struct cached_pkg *items = malloc(cap * sizeof(struct cached_pkg));
+  if (!items) {
+    alpm_release(handle);
+    return;
+  }
+
+  for (int r = 0; r < root_count; r++) {
+    DIR *top = opendir(roots[r]);
+    if (!top)
+      continue;
+    struct dirent *sub;
+    while ((sub = readdir(top)) != NULL) {
+      if (sub->d_name[0] == '.')
+        continue;
+      char pkgdir[PATH_MAX];
+      if (snprintf(pkgdir, sizeof(pkgdir), "%s/%s", roots[r], sub->d_name) >=
+          (int)sizeof(pkgdir))
+        continue;
+      struct stat dst;
+      if (lstat(pkgdir, &dst) != 0 || !S_ISDIR(dst.st_mode))
+        continue;
+
+      DIR *pd = opendir(pkgdir);
+      if (!pd)
+        continue;
+      struct dirent *fe;
+      while ((fe = readdir(pd)) != NULL) {
+        struct cached_pkg parsed;
+        if (parse_cached_pkg(fe->d_name, &parsed) != 0)
+          continue;
+
+        char full[PATH_MAX];
+        if (snprintf(full, sizeof(full), "%s/%s", pkgdir, fe->d_name) >=
+            (int)sizeof(full)) {
+          free(parsed.filename);
+          free(parsed.pkgname);
+          free(parsed.ver);
+          continue;
+        }
+        char *full_dup = strdup(full);
+        if (!full_dup) {
+          free(parsed.filename);
+          free(parsed.pkgname);
+          free(parsed.ver);
+          continue;
+        }
+        free(parsed.filename);
+        parsed.filename = full_dup;
+
+        if (count == cap) {
+          struct cached_pkg *tmp =
+              realloc(items, cap * 2 * sizeof(struct cached_pkg));
+          if (!tmp) {
+            free(parsed.filename);
+            free(parsed.pkgname);
+            free(parsed.ver);
+            break;
+          }
+          items = tmp;
+          cap *= 2;
+        }
+        items[count++] = parsed;
+      }
+      closedir(pd);
+    }
+    closedir(top);
+  }
+
+  qsort(items, count, sizeof(struct cached_pkg), cmp_cached_pkg);
+
+  size_t removed_pkgs = 0;
+  unsigned long long freed_bytes = 0;
+  for (size_t i = 0; i < count;) {
+    size_t j = i + 1;
+    while (j < count && strcmp(items[i].pkgname, items[j].pkgname) == 0)
+      j++;
+
+    size_t keep = (alpm_db_get_pkg(localdb, items[i].pkgname) != NULL) ? 2 : 0;
+    for (size_t k = i + keep; k < j; k++) {
+      struct stat st;
+      if (lstat(items[k].filename, &st) == 0 && S_ISREG(st.st_mode) &&
+          unlink(items[k].filename) == 0) {
+        freed_bytes += (unsigned long long)st.st_size;
+        removed_pkgs++;
+      }
+      char sig[PATH_MAX];
+      if (snprintf(sig, sizeof(sig), "%s.sig", items[k].filename) <
+              (int)sizeof(sig) &&
+          lstat(sig, &st) == 0 && S_ISREG(st.st_mode) && unlink(sig) == 0) {
+        freed_bytes += (unsigned long long)st.st_size;
+      }
+    }
+    i = j;
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    free(items[i].filename);
+    free(items[i].pkgname);
+    free(items[i].ver);
+  }
+  free(items);
+  alpm_release(handle);
+
+  if (removed_pkgs > 0) {
+    double mib = (double)freed_bytes / (1024.0 * 1024.0);
+    if (mib >= 1024.0) {
+      printf(CLR_GREEN "[✓] AUR build cache: removed %zu stale archive(s) "
+                       "(freed %.2f GiB).\n" CLR_RESET,
+             removed_pkgs, mib / 1024.0);
+    } else {
+      printf(CLR_GREEN "[✓] AUR build cache: removed %zu stale archive(s) "
+                       "(freed %.2f MiB).\n" CLR_RESET,
+             removed_pkgs, mib);
+    }
+  } else {
+    printf(CLR_GREEN
+           "[✓] AUR build cache already clean (kept last 2 versions).\n"
+           CLR_RESET);
+  }
+}
+
 struct str_vec {
   char **items;
   size_t count;
@@ -1631,28 +2182,293 @@ static void scan_pacnew_files(void) {
   free(found.items);
 }
 
-// Checks both system-wide and per-user systemd managers for failed units
+static const char *systemd_exit_tag(int status) {
+  switch (status) {
+  case 200:
+    return "200/CHDIR";
+  case 203:
+    return "203/EXEC";
+  case 217:
+    return "217/USER";
+  case 218:
+    return "218/CAPABILITIES";
+  case 219:
+    return "219/CGROUP";
+  case 226:
+    return "226/NAMESPACE";
+  default:
+    return NULL;
+  }
+}
+
+static int is_systemd_boilerplate_log(const char *line) {
+  if (strncmp(line, "Started ", 8) == 0 || strncmp(line, "Starting ", 9) == 0 ||
+      strncmp(line, "Stopped ", 8) == 0 || strncmp(line, "Stopping ", 9) == 0)
+    return 1;
+  if (strstr(line, ": Scheduled restart job") ||
+      strstr(line, ": Main process exited,") ||
+      strstr(line, ": Failed with result ") || strstr(line, ": Consumed ") ||
+      strstr(line, ": Failed at step EXEC spawning "))
+    return 1;
+  return 0;
+}
+
+// Inspects each failing or crash-looping unit via `systemctl show` and
+// `journalctl` to explain *why* it is failing and print a concrete fix hint.
+static void trace_systemd_units(const char *list_buf, int is_user) {
+  const char *scope_flag = is_user ? " --user" : "";
+  const char *cur = list_buf;
+
+  while (*cur != '\0') {
+    const char *nl = strchr(cur, '\n');
+    size_t llen = nl ? (size_t)(nl - cur) : strlen(cur);
+
+    // Extract first whitespace-delimited token (unit name)
+    const char *s = cur;
+    const char *end = cur + llen;
+    while (s < end && (*s == ' ' || *s == '\t' || *s == '*'))
+      s++;
+    const char *uend = s;
+    while (uend < end && *uend != ' ' && *uend != '\t' && *uend != '\r')
+      uend++;
+
+    char unit[128];
+    size_t ulen = (size_t)(uend - s);
+    if (ulen > 0 && ulen < sizeof(unit)) {
+      memcpy(unit, s, ulen);
+      unit[ulen] = '\0';
+
+      char prop_buf[4096];
+      int rc = 0;
+      if (is_user) {
+        char *const cmd[] = {
+            "systemctl",
+            "--user",
+            "show",
+            unit,
+            "-p",
+            "FragmentPath,ActiveState,SubState,Result,ExecMainStatus,NRestarts,"
+            "ExecStart",
+            NULL};
+        capture_cmd_output(cmd, prop_buf, sizeof(prop_buf), &rc);
+      } else {
+        char *const cmd[] = {
+            "systemctl",
+            "show",
+            unit,
+            "-p",
+            "FragmentPath,ActiveState,SubState,Result,ExecMainStatus,NRestarts,"
+            "ExecStart",
+            NULL};
+        capture_cmd_output(cmd, prop_buf, sizeof(prop_buf), &rc);
+      }
+
+      char frag[256] = "", active[32] = "", sub[32] = "", result[32] = "";
+      char exec_path[256] = "";
+      int exit_status = 0, restarts = 0;
+
+      const char *lp = prop_buf;
+      while (*lp != '\0') {
+        const char *lnl = strchr(lp, '\n');
+        size_t n = lnl ? (size_t)(lnl - lp) : strlen(lp);
+        if (n > 0 && lp[n - 1] == '\r')
+          n--;
+
+        if (n > 13 && strncmp(lp, "FragmentPath=", 13) == 0)
+          snprintf(frag, sizeof(frag), "%.*s", (int)(n - 13), lp + 13);
+        else if (n > 12 && strncmp(lp, "ActiveState=", 12) == 0)
+          snprintf(active, sizeof(active), "%.*s", (int)(n - 12), lp + 12);
+        else if (n > 9 && strncmp(lp, "SubState=", 9) == 0)
+          snprintf(sub, sizeof(sub), "%.*s", (int)(n - 9), lp + 9);
+        else if (n > 7 && strncmp(lp, "Result=", 7) == 0)
+          snprintf(result, sizeof(result), "%.*s", (int)(n - 7), lp + 7);
+        else if (n > 15 && strncmp(lp, "ExecMainStatus=", 15) == 0)
+          exit_status = atoi(lp + 15);
+        else if (n > 10 && strncmp(lp, "NRestarts=", 10) == 0)
+          restarts = atoi(lp + 10);
+        else if (n > 10 && strncmp(lp, "ExecStart=", 10) == 0) {
+          const char *path_key = strstr(lp + 10, "path=");
+          if (path_key && path_key < lp + n) {
+            path_key += 5;
+            const char *pe = path_key;
+            while (pe < lp + n && *pe != ' ' && *pe != ';')
+              pe++;
+            snprintf(exec_path, sizeof(exec_path), "%.*s",
+                     (int)(pe - path_key), path_key);
+          }
+        }
+        if (!lnl)
+          break;
+        lp = lnl + 1;
+      }
+
+      int exec_missing = (exec_path[0] == '/' && access(exec_path, F_OK) != 0);
+      int exec_noexec =
+          (!exec_missing && exec_path[0] == '/' && access(exec_path, X_OK) != 0);
+
+      // Pull up to 2 distinct non-boilerplate error lines from journalctl
+      char traces[2][256] = {"", ""};
+      int trace_count = 0;
+      int port_in_use = 0;
+      if (have_cmd("journalctl")) {
+        char jbuf[4096];
+        int jrc = 0;
+        if (is_user) {
+          char *const jcmd[] = {"journalctl", "--user", "-b",        "-u",
+                                unit,         "-n",     "12",        "-o",
+                                "cat",        "--no-pager", NULL};
+          capture_cmd_output(jcmd, jbuf, sizeof(jbuf), &jrc);
+        } else {
+          char *const jcmd[] = {"journalctl", "-b", "-u",         unit,
+                                "-n",         "12", "-o",         "cat",
+                                "--no-pager", NULL};
+          capture_cmd_output(jcmd, jbuf, sizeof(jbuf), &jrc);
+        }
+
+        const char *jp = jbuf;
+        while (*jp != '\0') {
+          const char *jnl = strchr(jp, '\n');
+          size_t jlen = jnl ? (size_t)(jnl - jp) : strlen(jp);
+          if (jlen > 0 && jp[jlen - 1] == '\r')
+            jlen--;
+
+          char line[256];
+          if (jlen > 0) {
+            snprintf(line, sizeof(line), "%.*s", (int)jlen, jp);
+            if (strstr(line, "address already in use") ||
+                strstr(line, "EADDRINUSE"))
+              port_in_use = 1;
+            if (!is_systemd_boilerplate_log(line)) {
+              int dup = 0;
+              for (int t = 0; t < trace_count; t++) {
+                if (strcmp(traces[t], line) == 0)
+                  dup = 1;
+              }
+              if (!dup && trace_count < 2)
+                snprintf(traces[trace_count++], sizeof(traces[0]), "%s", line);
+            }
+          }
+          if (!jnl)
+            break;
+          jp = jnl + 1;
+        }
+      }
+
+      // Check whether a user unit is colliding with an active system unit of
+      // the same name (e.g. both user and system ollama.service enabled).
+      int sys_twin_active = 0;
+      if (is_user) {
+        char dummy[64];
+        int arc = -1;
+        char *const acmd[] = {"systemctl", "is-active", "--quiet", unit, NULL};
+        capture_cmd_output(acmd, dummy, sizeof(dummy), &arc);
+        if (arc == 0)
+          sys_twin_active = 1;
+      }
+
+      const char *stag = systemd_exit_tag(exit_status);
+      char status_str[32];
+      if (stag)
+        snprintf(status_str, sizeof(status_str), "%s", stag);
+      else
+        snprintf(status_str, sizeof(status_str), "%d", exit_status);
+
+      printf("    " CLR_YELLOW "*" CLR_RESET " " CLR_CYAN "%s" CLR_RESET
+             " [%s/%s, result=%s, status=%s, restarts=%d]\n",
+             unit, active[0] ? active : "?", sub[0] ? sub : "?",
+             result[0] ? result : "?", status_str, restarts);
+      if (frag[0])
+        printf("      Unit : %s\n", frag);
+      if (exec_path[0]) {
+        if (exec_missing)
+          printf("      Exec : %s " CLR_RED "(MISSING on disk!)" CLR_RESET "\n",
+                 exec_path);
+        else if (exec_noexec)
+          printf("      Exec : %s " CLR_RED "(not executable!)" CLR_RESET "\n",
+                 exec_path);
+        else
+          printf("      Exec : %s\n", exec_path);
+      }
+      for (int t = 0; t < trace_count; t++)
+        printf("      Log  : %s\n", traces[t]);
+
+      if (exit_status == 203 || exec_missing) {
+        printf("      Why  : Target executable was uninstalled or moved, "
+               "leaving an orphaned service.\n");
+        printf("      Fix  : systemctl%s disable --now %s\n", scope_flag, unit);
+      } else if (exec_noexec) {
+        printf("      Why  : Target binary exists but lacks execute "
+               "permissions.\n");
+        printf("      Fix  : chmod +x %s\n", exec_path);
+      } else if (exit_status == 200) {
+        printf("      Why  : Configured WorkingDirectory no longer exists on "
+               "disk.\n");
+        printf("      Fix  : Edit %s or disable with: systemctl%s disable "
+               "--now %s\n",
+               frag[0] ? frag : unit, scope_flag, unit);
+      } else if (sys_twin_active) {
+        printf("      Why  : Duplicate unit — system-wide '%s' is already "
+               "running%s.\n",
+               unit, port_in_use ? " and holding the port" : "");
+        printf("      Fix  : systemctl --user disable --now %s\n", unit);
+      } else if (port_in_use) {
+        printf("      Why  : Port/socket is already bound by another "
+               "process.\n");
+        printf("      Fix  : ss -tulpn   (or systemctl%s disable --now %s)\n",
+               scope_flag, unit);
+      } else if (strcmp(result, "core-dump") == 0) {
+        printf("      Why  : Service process crashed with a signal/core "
+               "dump.\n");
+        printf("      Fix  : coredumpctl info %s\n", unit);
+      } else {
+        printf("      Fix  : journalctl%s -xeu %s\n", scope_flag, unit);
+      }
+    }
+
+    if (!nl)
+      break;
+    cur = nl + 1;
+  }
+}
+
+// Checks both system-wide and per-user systemd managers for failed units AND
+// crash-looping (`activating / auto-restart`) units, printing a root-cause
+// trace and actionable fix command for each unhealthy service.
 static void check_systemd_health(void) {
-  char *const sys_ok[] = {"systemctl", "is-system-running", "--quiet", NULL};
-  char *const sys_fail[] = {"systemctl", "--failed", "--no-legend", "--plain",
-                            NULL};
+  if (access("/run/systemd/system", F_OK) != 0 || !have_cmd("systemctl"))
+    return;
+
+  char *const sys_units[] = {
+      "systemctl",  "list-units", "--state=failed,auto-restart",
+      "--no-legend", "--plain",   "--no-pager",
+      NULL};
+  char buf[8192];
+  int rc = 0;
   int healthy = 1;
 
-  if (run_cmd(sys_ok) != 0) {
-    printf(CLR_YELLOW "[!] Degraded system systemd units:\n" CLR_RESET);
-    run_cmd(sys_fail);
+  if (capture_cmd_output(sys_units, buf, sizeof(buf), &rc) > 0 &&
+      buf[strspn(buf, " \t\r\n")] != '\0') {
+    printf(CLR_YELLOW "[!] Failed or crash-looping system systemd units:\n"
+                      CLR_RESET);
+    trace_systemd_units(buf, 0);
     healthy = 0;
   }
 
   const char *xdg = getenv("XDG_RUNTIME_DIR");
   if (xdg && *xdg != '\0') {
-    char *const usr_ok[] = {"systemctl", "--user", "is-system-running",
-                            "--quiet", NULL};
-    char *const usr_fail[] = {"systemctl",   "--user",  "--failed",
-                              "--no-legend", "--plain", NULL};
-    if (run_cmd(usr_ok) != 0) {
-      printf(CLR_YELLOW "[!] Degraded user systemd units:\n" CLR_RESET);
-      run_cmd(usr_fail);
+    char *const usr_units[] = {"systemctl",
+                               "--user",
+                               "list-units",
+                               "--state=failed,auto-restart",
+                               "--no-legend",
+                               "--plain",
+                               "--no-pager",
+                               NULL};
+    if (capture_cmd_output(usr_units, buf, sizeof(buf), &rc) > 0 &&
+        buf[strspn(buf, " \t\r\n")] != '\0') {
+      printf(CLR_YELLOW "[!] Failed or crash-looping user systemd units:\n"
+                        CLR_RESET);
+      trace_systemd_units(buf, 1);
       healthy = 0;
     }
   }
@@ -1661,6 +2477,340 @@ static void check_systemd_health(void) {
     printf(CLR_GREEN "[✓] All systemd system & user services healthy.\n"
                      CLR_RESET);
   }
+}
+
+static const char *sig_short_name(int sig) {
+  switch (sig) {
+  case 4:
+    return "SIGILL";
+  case 5:
+    return "SIGTRAP";
+  case 6:
+    return "SIGABRT";
+  case 7:
+    return "SIGBUS";
+  case 8:
+    return "SIGFPE";
+  case 11:
+    return "SIGSEGV";
+  case 31:
+    return "SIGSYS";
+  default:
+    return NULL;
+  }
+}
+
+// Summarizes any process coredumps recorded during the current boot via
+// `coredumpctl --json=short`, deduplicating repeated crashes by executable +
+// signal so silent background segfaults/aborts are surfaced cleanly.
+static void check_boot_coredumps(void) {
+  if (access("/run/systemd/system", F_OK) != 0 || !have_cmd("coredumpctl"))
+    return;
+
+  struct sysinfo si;
+  if (sysinfo(&si) != 0)
+    return;
+  long long boot_ts = (long long)time(NULL) - (long long)si.uptime;
+  if (boot_ts <= 0)
+    return;
+
+  char since_arg[64];
+  snprintf(since_arg, sizeof(since_arg), "--since=@%lld", boot_ts);
+
+  char buf[32768];
+  int rc = -1;
+  char *const cmd[] = {"coredumpctl", "list",         since_arg,
+                       "--json=short", "--no-pager", NULL};
+  if (capture_cmd_output(cmd, buf, sizeof(buf), &rc) <= 0 || rc != 0 ||
+      buf[0] != '[') {
+    printf(CLR_GREEN "[✓] No process coredumps recorded this boot.\n"
+                     CLR_RESET);
+    return;
+  }
+
+  struct crash_item {
+    char exe[256];
+    int sig;
+    int last_pid;
+    size_t count;
+  } items[32];
+  size_t item_count = 0;
+
+  const char *obj_start = NULL;
+  int depth = 0, in_str = 0;
+  for (const char *p = buf; *p != '\0'; p++) {
+    if (in_str) {
+      if (*p == '\\' && *(p + 1) != '\0')
+        p++;
+      else if (*p == '"')
+        in_str = 0;
+      continue;
+    }
+    if (*p == '"') {
+      in_str = 1;
+      continue;
+    }
+    if (*p == '{') {
+      if (depth == 0)
+        obj_start = p;
+      depth++;
+    } else if (*p == '}') {
+      depth--;
+      if (depth == 0 && obj_start) {
+        char exe[256] = "";
+        extract_json_str(obj_start, p, "\"exe\":", exe, sizeof(exe));
+        int sig = 0, pid = 0;
+        const char *sp = strstr(obj_start, "\"sig\":");
+        if (sp && sp < p)
+          sig = atoi(sp + 6);
+        const char *pp = strstr(obj_start, "\"pid\":");
+        if (pp && pp < p)
+          pid = atoi(pp + 6);
+
+        if (exe[0] != '\0') {
+          size_t idx = item_count;
+          for (size_t i = 0; i < item_count; i++) {
+            if (strcmp(items[i].exe, exe) == 0 && items[i].sig == sig) {
+              idx = i;
+              break;
+            }
+          }
+          if (idx < item_count) {
+            items[idx].count++;
+            if (pid > 0)
+              items[idx].last_pid = pid;
+          } else if (item_count < 32) {
+            snprintf(items[item_count].exe, sizeof(items[0].exe), "%s", exe);
+            items[item_count].sig = sig;
+            items[item_count].last_pid = pid;
+            items[item_count].count = 1;
+            item_count++;
+          }
+        }
+        obj_start = NULL;
+      }
+    }
+  }
+
+  if (item_count == 0) {
+    printf(CLR_GREEN "[✓] No process coredumps recorded this boot.\n"
+                     CLR_RESET);
+    return;
+  }
+
+  printf(CLR_YELLOW "[!] Process coredumps recorded this boot:\n" CLR_RESET);
+  for (size_t i = 0; i < item_count; i++) {
+    const char *sname = sig_short_name(items[i].sig);
+    char sig_buf[24];
+    if (sname)
+      snprintf(sig_buf, sizeof(sig_buf), "%s", sname);
+    else
+      snprintf(sig_buf, sizeof(sig_buf), "SIG#%d", items[i].sig);
+
+    const char *gone =
+        (items[i].exe[0] == '/' && access(items[i].exe, F_OK) != 0)
+            ? " [binary since removed]"
+            : "";
+
+    if (items[i].last_pid > 0) {
+      printf("    - %s%s (%s, %zux) -> inspect: coredumpctl info %d\n",
+             items[i].exe, gone, sig_buf, items[i].count, items[i].last_pid);
+    } else {
+      printf("    - %s%s (%s, %zux)\n", items[i].exe, gone, sig_buf,
+             items[i].count);
+    }
+  }
+}
+
+static void walk_dangling_systemd_links(const char *dir, int depth,
+                                        struct str_vec *out) {
+  if (depth > 2)
+    return;
+  DIR *d = opendir(dir);
+  if (!d)
+    return;
+
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (ent->d_name[0] == '.')
+      continue;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) >=
+        (int)sizeof(path))
+      continue;
+
+    struct stat lst, st;
+    if (lstat(path, &lst) != 0)
+      continue;
+    if (S_ISDIR(lst.st_mode)) {
+      walk_dangling_systemd_links(path, depth + 1, out);
+    } else if (S_ISLNK(lst.st_mode)) {
+      if (stat(path, &st) != 0 && errno == ENOENT) {
+        char target[PATH_MAX];
+        ssize_t tlen = readlink(path, target, sizeof(target) - 1);
+        char msg[PATH_MAX * 2 + 16];
+        if (tlen > 0) {
+          target[tlen] = '\0';
+          snprintf(msg, sizeof(msg), "%s -> %s", path, target);
+        } else {
+          snprintf(msg, sizeof(msg), "%s", path);
+        }
+        str_vec_add_unique(out, msg);
+      }
+    }
+  }
+  closedir(d);
+}
+
+// Audits three common configuration drift traps on Arch Linux:
+//   1. Unmanaged binaries in /usr/local/bin or ~/.local/bin shadowing /usr/bin
+//      packages (so pacman upgrades /usr/bin/<pkg> while PATH runs the old copy)
+//   2. Full unit copies in /etc/systemd/system/*.service masking package units
+//      in /usr/lib/systemd/system/ while pointing at /usr/local or missing bins
+//   3. Dangling .wants/.requires symlinks left behind by removed services
+static void check_shadowed_paths(void) {
+  struct str_vec shadowed_bins = {NULL, 0, 0};
+  const char *home = getenv("HOME");
+  char user_bin[PATH_MAX] = "";
+  if (home && home[0] == '/')
+    snprintf(user_bin, sizeof(user_bin), "%s/.local/bin", home);
+
+  const char *bin_dirs[2] = {"/usr/local/bin",
+                             user_bin[0] ? user_bin : NULL};
+  for (int d_idx = 0; d_idx < 2; d_idx++) {
+    if (!bin_dirs[d_idx])
+      continue;
+    DIR *d = opendir(bin_dirs[d_idx]);
+    if (!d)
+      continue;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+      if (ent->d_name[0] == '.')
+        continue;
+      char cand[PATH_MAX], sys_bin[PATH_MAX];
+      if (snprintf(cand, sizeof(cand), "%s/%s", bin_dirs[d_idx], ent->d_name) >=
+              (int)sizeof(cand) ||
+          snprintf(sys_bin, sizeof(sys_bin), "/usr/bin/%s", ent->d_name) >=
+              (int)sizeof(sys_bin))
+        continue;
+      if (access(cand, X_OK) != 0 || access(sys_bin, X_OK) != 0)
+        continue;
+
+      char real_cand[PATH_MAX], real_sys[PATH_MAX];
+      if (realpath(cand, real_cand) && realpath(sys_bin, real_sys) &&
+          strcmp(real_cand, real_sys) == 0)
+        continue;
+
+      char msg[PATH_MAX * 2 + 32];
+      snprintf(msg, sizeof(msg), "%s  (shadows %s)", cand, sys_bin);
+      str_vec_add_unique(&shadowed_bins, msg);
+    }
+    closedir(d);
+  }
+
+  struct str_vec shadowed_units = {NULL, 0, 0};
+  DIR *etc_sd = opendir("/etc/systemd/system");
+  if (etc_sd) {
+    struct dirent *ent;
+    while ((ent = readdir(etc_sd)) != NULL) {
+      size_t nlen = strlen(ent->d_name);
+      if (nlen <= 8 || strcmp(ent->d_name + nlen - 8, ".service") != 0)
+        continue;
+
+      char etc_path[PATH_MAX], lib_path[PATH_MAX];
+      if (snprintf(etc_path, sizeof(etc_path), "/etc/systemd/system/%s",
+                   ent->d_name) >= (int)sizeof(etc_path) ||
+          snprintf(lib_path, sizeof(lib_path), "/usr/lib/systemd/system/%s",
+                   ent->d_name) >= (int)sizeof(lib_path))
+        continue;
+
+      struct stat lst;
+      if (lstat(etc_path, &lst) != 0 || !S_ISREG(lst.st_mode) ||
+          access(lib_path, F_OK) != 0)
+        continue;
+
+      FILE *fp = fopen(etc_path, "r");
+      if (!fp)
+        continue;
+      char line[512];
+      while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t')
+          p++;
+        if (strncmp(p, "ExecStart=", 10) == 0) {
+          char *v = p + 10;
+          while (*v == ' ' || *v == '\t' || *v == '-' || *v == '@' ||
+                 *v == '+' || *v == '!' || *v == '"')
+            v++;
+          char exe[256];
+          size_t ei = 0;
+          while (*v != '\0' && *v != ' ' && *v != '\t' && *v != '"' &&
+                 *v != '\r' && *v != '\n' && ei + 1 < sizeof(exe))
+            exe[ei++] = *v++;
+          exe[ei] = '\0';
+
+          if (strncmp(exe, "/usr/local/", 11) == 0 ||
+              (exe[0] == '/' && access(exe, F_OK) != 0)) {
+            char msg[PATH_MAX * 2 + 320];
+            snprintf(msg, sizeof(msg), "%s (runs %s%s, masks %s)", etc_path,
+                     exe, (access(exe, F_OK) != 0) ? " [MISSING]" : "",
+                     lib_path);
+            str_vec_add_unique(&shadowed_units, msg);
+            break;
+          }
+        }
+      }
+      fclose(fp);
+    }
+    closedir(etc_sd);
+  }
+
+  struct str_vec dangling_links = {NULL, 0, 0};
+  walk_dangling_systemd_links("/etc/systemd/system", 0, &dangling_links);
+  if (home && home[0] == '/') {
+    char user_sd[PATH_MAX];
+    if (snprintf(user_sd, sizeof(user_sd), "%s/.config/systemd/user", home) <
+        (int)sizeof(user_sd))
+      walk_dangling_systemd_links(user_sd, 0, &dangling_links);
+  }
+
+  if (shadowed_bins.count > 0) {
+    qsort(shadowed_bins.items, shadowed_bins.count, sizeof(char *),
+          cmp_cstr_ptr);
+    printf(CLR_YELLOW "[!] Unmanaged binaries in PATH shadowing /usr/bin "
+                      "packages (%zu):\n" CLR_RESET,
+           shadowed_bins.count);
+    for (size_t i = 0; i < shadowed_bins.count; i++) {
+      printf("    - %s\n", shadowed_bins.items[i]);
+      free(shadowed_bins.items[i]);
+    }
+  }
+  free(shadowed_bins.items);
+
+  if (shadowed_units.count > 0) {
+    qsort(shadowed_units.items, shadowed_units.count, sizeof(char *),
+          cmp_cstr_ptr);
+    printf(CLR_YELLOW "[!] Custom /etc/systemd/system units masking package "
+                      "units (%zu):\n" CLR_RESET,
+           shadowed_units.count);
+    for (size_t i = 0; i < shadowed_units.count; i++) {
+      printf("    - %s\n", shadowed_units.items[i]);
+      free(shadowed_units.items[i]);
+    }
+  }
+  free(shadowed_units.items);
+
+  if (dangling_links.count > 0) {
+    qsort(dangling_links.items, dangling_links.count, sizeof(char *),
+          cmp_cstr_ptr);
+    printf(CLR_YELLOW "[!] Dangling systemd unit symlinks (%zu):\n" CLR_RESET,
+           dangling_links.count);
+    for (size_t i = 0; i < dangling_links.count; i++) {
+      printf("    - %s\n", dangling_links.items[i]);
+      free(dangling_links.items[i]);
+    }
+  }
+  free(dangling_links.items);
 }
 
 static size_t count_subdirs(const char *dir) {
@@ -1846,8 +2996,8 @@ static void usage(const char *prog) {
          "Zero-extra-dependency Arch Linux maintenance: official repos + AUR +\n"
          "Flatpak + Snap upgrades, native cache/orphan cleanup, and health "
          "checks.\n\n"
-         "  -c, --check   Read-only report of pending repo/AUR updates & Arch "
-         "News\n"
+         "  -c, --check   Read-only update, package DB, service, boot & kernel "
+         "health report\n"
          "  -y, --yes     Unattended: auto-confirm every package manager "
          "prompt\n"
          "  -h, --help    Show this help\n\n"
@@ -1863,7 +3013,7 @@ int main(int argc, char *argv[]) {
   int scan_pacnew_only = 0;
 
   // Parse CLI flags:
-  //   -c, --check   : Run read-only ALPM + AUR + Arch News telemetry and exit
+  //   -c, --check   : Run read-only update + package/system health checks
   //   -y, --yes     : Auto-confirm yay/paru/pacman/flatpak prompts (unattended)
   //   -h, --help    : Show usage
   //   --clean-cache : Internal root helper for native pacman cache trimming
@@ -1919,6 +3069,17 @@ int main(int argc, char *argv[]) {
   run_alpm_telemetry(check_only, aur_helper != NULL);
 
   if (check_only) {
+    printf("\n");
+    check_package_database();
+    check_dkms_status();
+    scan_pacnew_files();
+    check_shadowed_paths();
+    check_boot_mounts(1);
+    check_systemd_health();
+    check_boot_coredumps();
+    check_boot_performance();
+    check_kernel_reboot();
+    check_stale_libs();
     return EXIT_SUCCESS;
   }
 
@@ -1930,17 +3091,17 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  // Pre-flight storage check on root, pacman package cache, and /boot
+  // Pre-flight storage & boot/ESP mount check before touching packages
   printf("\n");
   if (check_disk_space("/", MIN_FREE_GIB) != 0 ||
       check_disk_space("/var/cache/pacman/pkg", MIN_FREE_GIB) != 0 ||
-      check_disk_space("/boot", 0.15) != 0) {
+      check_boot_mounts(0) != 0) {
     return EXIT_FAILURE;
   }
 
   int has_flatpak = have_cmd("flatpak");
   int has_snap = have_cmd("snap");
-  int total_steps = 5 + has_flatpak + has_snap;
+  int total_steps = 6 + has_flatpak + has_snap;
   int step = 0;
 
   if (!have_cmd("sudo")) {
@@ -2032,13 +3193,17 @@ int main(int argc, char *argv[]) {
                          CLR_RESET);
   }
 
+  print_step(&step, total_steps, "Verifying package database consistency...");
+  check_package_database();
+  check_dkms_status();
+
   print_step(&step, total_steps, "Sweeping orphaned dependencies...");
   sweep_orphans(aur_helper, auto_yes);
 
   print_step(&step, total_steps,
-             has_flatpak ? "Cleaning caches (pacman: keep last 2 versions, "
+             has_flatpak ? "Cleaning caches (pacman/AUR: keep last 2 versions, "
                            "drop uninstalled; unused Flatpak runtimes)..."
-                         : "Cleaning caches (pacman: keep last 2 versions, "
+                         : "Cleaning caches (pacman/AUR: keep last 2 versions, "
                            "drop uninstalled)...");
   if (self_len > 0) {
     char *const sudo_cache[] = {"sudo", self_exe, "--clean-cache", NULL};
@@ -2047,13 +3212,14 @@ int main(int argc, char *argv[]) {
   } else {
     clean_pacman_cache();
   }
+  clean_aur_cache();
   if (has_flatpak) {
     run_cmd(fp_sys_cln);
     run_cmd(fp_usr_cln);
   }
 
   print_step(&step, total_steps,
-             "Scanning for unmerged .pacnew / .pacsave files...");
+             "Scanning for unmerged .pacnew / .pacsave & shadowed paths...");
   if (self_len > 0) {
     char *const sudo_pacnew[] = {"sudo", self_exe, "--scan-pacnew", NULL};
     if (run_cmd(sudo_pacnew) != 0)
@@ -2061,10 +3227,13 @@ int main(int argc, char *argv[]) {
   } else {
     scan_pacnew_files();
   }
+  check_shadowed_paths();
 
   print_step(&step, total_steps,
              "Checking systemd system & user service health...");
   check_systemd_health();
+  check_boot_coredumps();
+  check_boot_performance();
 
   print_sys_summary();
 

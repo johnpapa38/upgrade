@@ -10,7 +10,7 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
   - Downloads fresh copies of the sync databases into a private folder you own (`/tmp/upgrade-db-<uid>`). Your system's pacman databases are never touched.
   - Lists pending repo updates and checks every foreign package against the AUR RPC v5 API.
   - Checks the official **Arch Linux News** feed (`archlinux.org/feeds/news/`) and warns if any advisory was posted since your last upgrade.
-  - Flags foreign packages that are no longer in the AUR.
+  - Flags AUR packages marked out-of-date or orphaned (`Maintainer: null`), as well as foreign packages no longer in the AUR.
   - Respects `IgnorePkg` / `IgnoreGroup` from `/etc/pacman.conf`.
 - **Asks for sudo once**
   - Uses your existing sudo login if it's still valid, otherwise asks for your password a single time.
@@ -22,12 +22,14 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
   - Snap
 - **Cleans up natively (no `pacman-contrib` needed)**
   - Detects orphaned dependencies directly via `libalpm` (skips cleanup altogether when 0 orphans exist)
-  - Trims the pacman cache in C using `alpm_pkg_vercmp()` (keeps the last 2 versions of installed packages, drops cached tarballs for uninstalled packages, and sweeps leftover `download-*` sandbox folders)
+  - Trims both the pacman cache and `~/.cache/yay` / `~/.cache/paru/clone` built `.pkg.tar*` archives in C using `alpm_pkg_vercmp()` (keeps the last 2 versions of installed packages, drops cached tarballs for uninstalled packages, sweeps leftover `download-*` sandbox folders, and leaves `PKGBUILD`s / git clones untouched)
   - Removes unused Flatpak runtimes
 - **Checks system health & prints a built-in C summary (no `fastfetch` needed)**
-  - Pre-flight checks: free disk space on `/`, the package cache and `/boot`, and whether the pacman database is locked
+  - Pre-flight checks: free disk space on `/`, the package cache, and `/boot` / `/efi` / `/boot/efi`, whether any `/etc/fstab` boot/ESP partition is unmounted or read-only (`ro`), and whether the pacman database is locked
+  - Local package database consistency verification (`pacman -Dkq`) and DKMS kernel module build audit (`dkms status`, when installed)
   - Native `.pacnew` / `.pacsave` / `.pacorig` scanner via `libalpm` backup metadata + `/etc` walk
-  - Checks both system-wide and `--user` systemd managers for failed services
+  - Configuration-drift & shadowing audit: flags unmanaged binaries in `/usr/local/bin` or `~/.local/bin` that shadow `/usr/bin` packages, custom `/etc/systemd/system/*.service` copies masking package units, and dangling `.wants` symlinks
+  - Checks both system-wide and `--user` systemd managers for failed and crash-looping (`auto-restart`) services — printing a root-cause trace (`Unit`, `Exec`, filtered `journalctl` error log, plain-English `Why`, and exact `Fix` command) instead of bare unit names — plus current-boot coredump summary (`coredumpctl`) and boot timing (`systemd-analyze`)
   - Built-in C system summary card (OS, kernel, uptime + load, CPU, RAM, `/` disk, package counts)
   - Warns if the kernel was upgraded and a reboot is due
   - Lists processes (including root daemons) running a deleted executable or holding deleted shared libraries in RAM
@@ -63,7 +65,7 @@ Uninstall with `sudo make uninstall`. Change the install location with `PREFIX`,
 ```sh
 up               # (or `upgrade`) full update + cleanup (interactive prompts)
 up -y            # unattended: auto-confirm prompts + conflict replacements
-up -c            # read-only report of pending repo/AUR updates; needs no root
+up -c            # read-only update, package DB, DKMS, service, boot & kernel report
 up -h            # help
 ```
 
@@ -76,16 +78,17 @@ Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR hel
 
 [✓] Storage check '/': 426.30 GiB available.
 [✓] Storage check '/var/cache/pacman/pkg': 426.30 GiB available.
-[✓] Storage check '/boot': 1.80 GiB available.
+[✓] Storage check '/efi': 1.80 GiB available.
 
 :: Requesting sudo privileges (asked at most once per run)...
-:: [1/7] Synchronizing & upgrading packages (Repo + AUR)...
-:: [2/7] Updating Flatpak apps & runtimes...
-:: [3/7] Refreshing Snap packages...
-:: [4/7] Sweeping orphaned dependencies...
-:: [5/7] Cleaning caches (pacman: keep last 2 versions, drop uninstalled; unused Flatpak runtimes)...
-:: [6/7] Scanning for unmerged .pacnew / .pacsave files...
-:: [7/7] Checking systemd system & user service health...
+:: [1/8] Synchronizing & upgrading packages (Repo + AUR)...
+:: [2/8] Updating Flatpak apps & runtimes...
+:: [3/8] Refreshing Snap packages...
+:: [4/8] Verifying package database consistency...
+:: [5/8] Sweeping orphaned dependencies...
+:: [6/8] Cleaning caches (pacman/AUR: keep last 2 versions, drop uninstalled; unused Flatpak runtimes)...
+:: [7/8] Scanning for unmerged .pacnew / .pacsave & shadowed paths...
+:: [8/8] Checking systemd system & user service health...
 
    user@arch
    ---------

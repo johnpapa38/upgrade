@@ -53,7 +53,7 @@ sudo pacman -S --needed base-devel
 git clone https://github.com/johnpapa38/upgrade.git
 cd upgrade
 make
-sudo make install          # installs to /usr/local/bin/upgrade
+sudo make install          # installs /usr/local/bin/upgrade and 'up' symlink
 ```
 
 Uninstall with `sudo make uninstall`. Change the install location with `PREFIX`, e.g. `make install PREFIX=$HOME/.local` (no sudo needed).
@@ -61,10 +61,10 @@ Uninstall with `sudo make uninstall`. Change the install location with `PREFIX`,
 ## Usage
 
 ```sh
-upgrade          # full update + cleanup (interactive prompts)
-upgrade -y       # unattended: auto-confirm package manager prompts
-upgrade -c       # read-only report of pending repo/AUR updates; needs no root
-upgrade -h       # help
+up               # (or `upgrade`) full update + cleanup (interactive prompts)
+up -y            # unattended: auto-confirm prompts + conflict replacements
+up -c            # read-only report of pending repo/AUR updates; needs no root
+up -h            # help
 ```
 
 Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR helpers and `makepkg` refuse to build as root. `upgrade` asks for sudo rights itself, only for the steps that need them.
@@ -104,7 +104,7 @@ Steps for tools you don't have installed are skipped automatically.
 
 ## Notes
 
-- **`-y` / `--yes`** passes `--noconfirm` to pacman/yay/paru and `-y` to Flatpak. pacman then takes the default answer to every question. For package conflicts that answer is "no", so the upgrade stops instead of guessing. Read the [Arch news](https://archlinux.org/news/) before running unattended upgrades.
+- **`-y` / `--yes` & package conflicts:** passes `--noconfirm --ask=4` (`ALPM_QUESTION_CONFLICT_PKG`) to pacman/yay/paru and `-y` to Flatpak, so legitimate repo package replacements swap atomically inside the transaction without blindly removing dependency trees. If `-y` still hits an unresolvable dependency conflict while running in a terminal, `upgrade` automatically retries `-Syu` interactively so you can inspect and decide. Read the [Arch news](https://archlinux.org/news/) (also checked automatically before upgrading) for manual-intervention notices.
 - **No signature checks in the report:** the copies of the databases used by `-c` and the pre-upgrade report aren't signature-checked, because root's keyring can't be used without root. They are only used for displaying updates. The real upgrade runs pacman as root with full signature checks.
 - **Privacy:** the AUR check sends the names of your foreign (non-repo) packages to `aur.archlinux.org`.
 - **Logging:** output stays in the correct order when piped, e.g. `upgrade | tee ~/upgrade.log`.

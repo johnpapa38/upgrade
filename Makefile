@@ -21,9 +21,10 @@ debug: clean $(BIN)
 
 install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	ln -sf $(BIN) $(DESTDIR)$(PREFIX)/bin/up
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN) $(DESTDIR)$(PREFIX)/bin/up
 
 clean:
 	rm -f $(BIN)

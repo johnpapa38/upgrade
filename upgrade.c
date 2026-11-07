@@ -50,7 +50,8 @@ struct foreign_pkg {
 
 // Forks and executes an external command, waiting for it to finish.
 // Retries waitpid() if interrupted by a signal (EINTR).
-// Returns 0 if the child exited cleanly with status 0, or -1 on error/failure.
+// Returns 0 on exit status 0, -2 if interrupted by SIGINT/SIGTERM, or -1 on
+// any other non-zero exit / error.
 static int run_cmd(char *const argv[]) {
   // Flush our buffered output first so it stays ordered with the child's
   // output when stdout is a pipe or log file (e.g. `upgrade | tee log`)
@@ -70,7 +71,16 @@ static int run_cmd(char *const argv[]) {
     if (errno != EINTR)
       return -1;
   }
-  return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+  if (WIFSIGNALED(status) &&
+      (WTERMSIG(status) == SIGINT || WTERMSIG(status) == SIGTERM))
+    return -2;
+  if (WIFEXITED(status)) {
+    if (WEXITSTATUS(status) == 0)
+      return 0;
+    if (WEXITSTATUS(status) == 128 + SIGINT)
+      return -2;
+  }
+  return -1;
 }
 
 // libcurl write callback: appends incoming HTTP response chunks into a
@@ -1902,12 +1912,20 @@ int main(int argc, char *argv[]) {
   if (self_len > 0)
     self_exe[self_len] = '\0';
 
-  // NULL here simply terminates the argv early when not running with -y
+  // NULL here simply terminates the argv early when not running with -y.
+  // With -y, `--ask=4` (ALPM_QUESTION_CONFLICT_PKG) lets pacman/yay/paru
+  // swap conflicting/replaced packages atomically inside the transaction
+  // instead of aborting on `--noconfirm`'s default "No".
   char *noconfirm = auto_yes ? "--noconfirm" : NULL;
+  char *ask_conflict = auto_yes ? "--ask=4" : NULL;
   char *fp_yes = auto_yes ? "-y" : NULL;
 
-  char *const up_aur[] = {(char *)aur_helper, "-Syu", noconfirm, NULL};
-  char *const up_pacman[] = {"sudo", "pacman", "-Syu", noconfirm, NULL};
+  char *const up_aur[] = {(char *)aur_helper, "-Syu", noconfirm, ask_conflict,
+                          NULL};
+  char *const up_aur_ask[] = {(char *)aur_helper, "-Syu", NULL};
+  char *const up_pacman[] = {"sudo",    "pacman",     "-Syu",
+                             noconfirm, ask_conflict, NULL};
+  char *const up_pacman_ask[] = {"sudo", "pacman", "-Syu", NULL};
   char *const fp_sys_up[] = {"sudo",     "flatpak", "update",
                              "--system", fp_yes,    NULL};
   char *const fp_usr_up[] = {"flatpak", "update", "--user", fp_yes, NULL};
@@ -1921,7 +1939,14 @@ int main(int argc, char *argv[]) {
   if (aur_helper) {
     print_step(&step, total_steps,
                "Synchronizing & upgrading packages (Repo + AUR)...");
-    if (run_cmd(up_aur) != 0) {
+    int rc = run_cmd(up_aur);
+    if (rc == -1 && auto_yes && isatty(STDIN_FILENO) &&
+        access("/var/lib/pacman/db.lck", F_OK) != 0) {
+      printf(CLR_YELLOW "\n:: Unattended upgrade hit an unresolved conflict — "
+                        "retrying interactively...\n" CLR_RESET);
+      rc = run_cmd(up_aur_ask);
+    }
+    if (rc != 0) {
       fprintf(stderr, CLR_RED ":: Upgrade failed or cancelled.\n" CLR_RESET);
       return EXIT_FAILURE;
     }
@@ -1929,7 +1954,14 @@ int main(int argc, char *argv[]) {
     print_step(&step, total_steps,
                "Synchronizing & upgrading packages (Repo only; no yay/paru "
                "found for AUR)...");
-    if (run_cmd(up_pacman) != 0) {
+    int rc = run_cmd(up_pacman);
+    if (rc == -1 && auto_yes && isatty(STDIN_FILENO) &&
+        access("/var/lib/pacman/db.lck", F_OK) != 0) {
+      printf(CLR_YELLOW "\n:: Unattended upgrade hit an unresolved conflict — "
+                        "retrying interactively...\n" CLR_RESET);
+      rc = run_cmd(up_pacman_ask);
+    }
+    if (rc != 0) {
       fprintf(stderr, CLR_RED ":: Upgrade failed or cancelled.\n" CLR_RESET);
       return EXIT_FAILURE;
     }

@@ -44,8 +44,9 @@ struct mem_buf {
 struct foreign_pkg {
   const char *name;
   const char *ver;
-  uint8_t in_aur; // Set to 1 once confirmed present in AUR RPC results
-  uint8_t ignored; // Set to 1 if matched by IgnorePkg/IgnoreGroup
+  uint8_t in_aur;      // Set to 1 once confirmed present in AUR RPC results
+  uint8_t ignored;     // Set to 1 if matched by IgnorePkg/IgnoreGroup
+  uint8_t out_of_date; // Set to 1 if OutOfDate is non-null in AUR RPC
 };
 
 // Forks and executes an external command, waiting for it to finish.
@@ -244,9 +245,20 @@ static size_t audit_aur_packages(CURL *curl, struct foreign_pkg *pkgs,
               extract_json_str(obj_start, p, "\"Version\":", aur_ver,
                                sizeof(aur_ver)) == 0) {
 
+            const char *ood = strstr(obj_start, "\"OutOfDate\":");
+            int is_ood = 0;
+            if (ood && ood < p) {
+              ood += 12;
+              while (ood < p && (*ood == ' ' || *ood == '\t'))
+                ood++;
+              if (ood < p && isdigit((unsigned char)*ood))
+                is_ood = 1;
+            }
+
             for (size_t i = batch_start; i < batch_end; i++) {
               if (strcmp(pkgs[i].name, pkg_name) == 0) {
                 pkgs[i].in_aur = 1;
+                pkgs[i].out_of_date = (uint8_t)is_ood;
                 if (!pkgs[i].ignored &&
                     alpm_pkg_vercmp(aur_ver, pkgs[i].ver) > 0) {
                   if (aur_updates == 0) {
@@ -270,6 +282,20 @@ static size_t audit_aur_packages(CURL *curl, struct foreign_pkg *pkgs,
   }
 
   free(url);
+
+  // Report installed AUR packages flagged out-of-date upstream
+  size_t flagged_ood = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (pkgs[i].in_aur && pkgs[i].out_of_date) {
+      if (flagged_ood == 0) {
+        printf(CLR_YELLOW "\n[!] Flagged Out-of-Date AUR Packages:" CLR_RESET);
+      }
+      printf(" %s", pkgs[i].name);
+      flagged_ood++;
+    }
+  }
+  if (flagged_ood > 0)
+    printf("\n");
 
   // Any foreign package still marked in_aur == 0 was not returned by AUR RPC
   size_t unmaintained = 0;
@@ -739,19 +765,34 @@ static int prepare_tmp_dbpath(char *out, size_t out_sz) {
   return 0;
 }
 
-// Walks the local pacman database via libalpm to:
-//   1. Count total installed packages and cumulative installed size on disk.
-//   2. Compare installed repo packages against local sync DBs for updates.
-//   3. Collect foreign packages (not in any sync DB) and query AUR RPC v5.
-static void run_alpm_telemetry(void) {
+// In read-only check mode (`check_only == 1`), refreshes sync DBs into a
+// private user-owned dbpath, compares repo + AUR versions, and checks Arch
+// News. During a full upgrade (`check_only == 0`), avoids duplicating the
+// sync DB download (and AUR RPC query when yay/paru is present) since step [1]
+// immediately runs `-Syu`.
+static void run_alpm_telemetry(int check_only, int has_aur_helper) {
+  // Fast path for full upgrade when yay/paru will handle repo + AUR sync itself:
+  // only check Arch Linux News before upgrading.
+  if (!check_only && has_aur_helper) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CURL *curl = curl_easy_init();
+    if (curl) {
+      check_arch_news(curl);
+      curl_easy_cleanup(curl);
+    }
+    curl_global_cleanup();
+    return;
+  }
+
   struct timespec t0, t1;
   clock_gettime(CLOCK_MONOTONIC, &t0);
 
   alpm_errno_t err;
-  // Prefer a private dbpath whose sync DBs we can refresh without root;
-  // fall back to the (possibly stale) system DBs if it can't be set up.
+  // Only download private sync DBs in `-c` check mode; full upgrade is about
+  // to run `pacman -Syu` directly.
   char tmp_dbpath[PATH_MAX];
-  int fresh = (prepare_tmp_dbpath(tmp_dbpath, sizeof(tmp_dbpath)) == 0);
+  int fresh =
+      check_only && (prepare_tmp_dbpath(tmp_dbpath, sizeof(tmp_dbpath)) == 0);
   alpm_handle_t *handle =
       alpm_initialize("/", fresh ? tmp_dbpath : "/var/lib/pacman", &err);
   if (!handle && fresh) {
@@ -840,9 +881,10 @@ static void run_alpm_telemetry(void) {
       foreign[foreign_count].in_aur = 0;
       foreign[foreign_count].ignored =
           alpm_pkg_should_ignore(handle, local_pkg) ? 1 : 0;
+      foreign[foreign_count].out_of_date = 0;
       foreign_count++;
-    } else {
-      // Official repo package -> compare cached sync DB version vs installed
+    } else if (check_only) {
+      // Official repo package -> compare live sync DB version vs installed
       const char *sync_ver = alpm_pkg_get_version(sync_pkg);
       if (alpm_pkg_vercmp(sync_ver, local_ver) > 0 &&
           !alpm_pkg_should_ignore(handle, local_pkg)) {
@@ -1717,13 +1759,17 @@ static void print_sys_summary(void) {
   double load1 = (double)si.loads[0] / (double)(1 << SI_LOAD_SHIFT);
   double load5 = (double)si.loads[1] / (double)(1 << SI_LOAD_SHIFT);
 
-  // Package counts (pacman via libalpm + Flatpak app dirs if present)
+  // Package counts + installed size (pacman via libalpm + Flatpak app dirs)
   size_t pacman_pkgs = 0;
+  off_t pacman_bytes = 0;
   alpm_errno_t err;
   alpm_handle_t *handle = alpm_initialize("/", "/var/lib/pacman", &err);
   if (handle) {
-    pacman_pkgs =
-        alpm_list_count(alpm_db_get_pkgcache(alpm_get_localdb(handle)));
+    for (alpm_list_t *i = alpm_db_get_pkgcache(alpm_get_localdb(handle));
+         i != NULL; i = alpm_list_next(i)) {
+      pacman_pkgs++;
+      pacman_bytes += alpm_pkg_get_isize(i->data);
+    }
     alpm_release(handle);
   }
   size_t flatpak_pkgs = count_subdirs("/var/lib/flatpak/app");
@@ -1779,12 +1825,14 @@ static void print_sys_summary(void) {
            "Disk (/)", used, tot, avail);
   }
 
+  double pkg_gib = (double)pacman_bytes / (1024.0 * 1024.0 * 1024.0);
   if (flatpak_pkgs > 0) {
-    printf("   " CLR_CYAN "%-10s" CLR_RESET " %zu (pacman), %zu (flatpak)\n",
-           "Packages", pacman_pkgs, flatpak_pkgs);
+    printf("   " CLR_CYAN "%-10s" CLR_RESET
+           " %zu (pacman, %.2f GiB), %zu (flatpak)\n",
+           "Packages", pacman_pkgs, pkg_gib, flatpak_pkgs);
   } else {
-    printf("   " CLR_CYAN "%-10s" CLR_RESET " %zu (pacman)\n", "Packages",
-           pacman_pkgs);
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %zu (pacman, %.2f GiB)\n",
+           "Packages", pacman_pkgs, pkg_gib);
   }
 }
 
@@ -1864,7 +1912,11 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  run_alpm_telemetry();
+  // Detect optional package managers (everything else is built in natively)
+  const char *aur_helper =
+      have_cmd("yay") ? "yay" : (have_cmd("paru") ? "paru" : NULL);
+
+  run_alpm_telemetry(check_only, aur_helper != NULL);
 
   if (check_only) {
     return EXIT_SUCCESS;
@@ -1886,9 +1938,6 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  // Detect optional package managers (everything else is built in natively)
-  const char *aur_helper =
-      have_cmd("yay") ? "yay" : (have_cmd("paru") ? "paru" : NULL);
   int has_flatpak = have_cmd("flatpak");
   int has_snap = have_cmd("snap");
   int total_steps = 5 + has_flatpak + has_snap;

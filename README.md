@@ -72,11 +72,12 @@ Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR hel
 ### What a run looks like
 
 ```
-:: Refreshing sync DBs into /tmp/upgrade-db-1000 (no root needed)...
-:: Auditing /var/lib/pacman via libalpm & AUR RPC v5...
-[!] Pending Repo Updates (live sync DBs):
-    gdu                          5.38.0-1 -> 5.39.0-1
-...
+[✓] Arch Linux News: no new advisories since last upgrade.
+
+[✓] Storage check '/': 426.30 GiB available.
+[✓] Storage check '/var/cache/pacman/pkg': 426.30 GiB available.
+[✓] Storage check '/boot': 1.80 GiB available.
+
 :: Requesting sudo privileges (asked at most once per run)...
 :: [1/7] Synchronizing & upgrading packages (Repo + AUR)...
 :: [2/7] Updating Flatpak apps & runtimes...
@@ -94,7 +95,7 @@ Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR hel
    CPU        AMD Ryzen ... (16 threads)
    Memory     4.10 / 31.20 GiB (13%)
    Disk (/)   48.20 / 500.00 GiB used (426.30 GiB free)
-   Packages   1120 (pacman), 14 (flatpak)
+   Packages   1120 (pacman, 18.40 GiB), 14 (flatpak)
 
 [✓] Kernel modules intact (6.x.y-arch1-1) — no immediate reboot required.
 [✓] No processes holding stale binaries or shared libraries.

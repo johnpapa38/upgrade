@@ -1,0 +1,41 @@
+# Maintainer: johnpapa38 <johnpapa38@users.noreply.github.com>
+pkgname=arch-up
+pkgver=3.2.0
+pkgrel=1
+pkgdesc="Zero-prompt Arch updater (repos, AUR, Flatpak, Snap, cleanup & health) via 'up'"
+arch=('x86_64' 'aarch64')
+url="https://github.com/johnpapa38/upgrade"
+license=('MIT')
+depends=('pacman' 'curl' 'sudo')
+optdepends=(
+  'yay: AUR updates and automatic library rebuilds'
+  'paru: alternative AUR helper'
+  'flatpak: Flatpak updates and unused runtime cleanup'
+  'snapd: Snap package updates'
+  'smartmontools: NVMe and SATA SMART disk health checks'
+  'dmidecode: DIMM memory inventory checks'
+  'rebuild-detector: automatic AUR rebuild detection'
+  'arch-audit: CVE vulnerability audit'
+  'fwupd: LVFS device firmware update checks'
+  'snapper: pre-upgrade Btrfs rollback snapshots'
+)
+provides=('upgrade')
+conflicts=('upgrade' 'up')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('7aafa122643b5a554c06158497f6ee0dfc2bbfb23a5c3d014c6ae950c14f81da')
+
+build() {
+  cd "upgrade-$pkgver"
+  make
+}
+
+check() {
+  cd "upgrade-$pkgver"
+  ASAN_OPTIONS=detect_leaks=0 make test
+}
+
+package() {
+  cd "upgrade-$pkgver"
+  make DESTDIR="$pkgdir" PREFIX=/usr install
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

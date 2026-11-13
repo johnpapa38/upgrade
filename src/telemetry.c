@@ -32,20 +32,29 @@ int check_pacman_lock(int check_only) {
             CLR_RED "[!] Pacman database is locked by active %s (PID %ld).\n"
                     "    Wait for it to finish before upgrading.\n" CLR_RESET,
             comm[0] ? comm : "process", lock_pid);
+    return -1;
   } else if (lock_pid > 0) {
+    if (!check_only) {
+      printf(CLR_YELLOW "[!] Stale /var/lib/pacman/db.lck detected (PID %ld is "
+                        "no longer running) — clearing automatically.\n"
+                        CLR_RESET,
+             lock_pid);
+      return -2;
+    }
     fprintf(out,
             CLR_RED "[!] Stale /var/lib/pacman/db.lck detected (PID %ld is no "
                     "longer running).\n"
                     "    Clear it with: sudo rm -f /var/lib/pacman/db.lck\n"
                     CLR_RESET,
             lock_pid);
+    return -1;
   } else {
     fprintf(out,
             CLR_RED "[!] /var/lib/pacman/db.lck exists!\n"
                     "    If no package manager is running, clear it with: "
                     "sudo rm -f /var/lib/pacman/db.lck\n" CLR_RESET);
+    return -1;
   }
-  return -1;
 }
 
 // Verifies that the pacman GnuPG keyring is initialized and populated on disk.
@@ -64,6 +73,91 @@ void check_pacman_keyring(void) {
     printf(CLR_YELLOW "[!] Pacman GPG public keyring appears empty (%lld B).\n"
                       "    Fix: sudo pacman-key --populate\n" CLR_RESET,
            (long long)st.st_size);
+  }
+}
+
+// Audits /etc/pacman.d/mirrorlist (active servers, age, unmerged .pacnew)
+// and local sync DB freshness in check mode.
+void check_mirrorlist_health(int check_only) {
+  if (access("/etc/pacman.d/mirrorlist.pacnew", F_OK) == 0) {
+    printf(CLR_YELLOW "[!] /etc/pacman.d/mirrorlist.pacnew exists — merge "
+                      "updated mirrors with `upgrade --pacnew` or pacdiff.\n"
+                      CLR_RESET);
+  }
+
+  FILE *fp = fopen("/etc/pacman.d/mirrorlist", "r");
+  if (!fp) {
+    if (errno != EACCES) {
+      printf(CLR_YELLOW "[!] Cannot open /etc/pacman.d/mirrorlist: %s\n"
+                        CLR_RESET,
+             strerror(errno));
+    }
+    return;
+  }
+
+  size_t active_servers = 0;
+  char line[1024];
+  while (fgets(line, sizeof(line), fp)) {
+    char *p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (strncmp(p, "Server", 6) == 0 && conf_value(p) != NULL)
+      active_servers++;
+  }
+  fclose(fp);
+
+  if (active_servers == 0) {
+    printf(CLR_RED "[!] Mirrorlist: 0 active 'Server =' entries in "
+                   "/etc/pacman.d/mirrorlist!\n" CLR_RESET);
+    return;
+  }
+
+  struct stat st;
+  if (stat("/etc/pacman.d/mirrorlist", &st) == 0) {
+    time_t now = time(NULL);
+    long age_days = (now > st.st_mtime) ? (long)((now - st.st_mtime) / 86400) : 0;
+    if (age_days > 45) {
+      printf(CLR_MAGENTA "[i] Mirrorlist: %zu active server(s), last updated "
+                         "%ld day(s) ago%s.\n" CLR_RESET,
+             active_servers, age_days,
+             have_cmd("reflector")
+                 ? " (refresh with reflector)"
+                 : " (check archlinux.org/mirrorlist)");
+    } else if (check_only) {
+      printf(CLR_GREEN "[✓] Mirrorlist: %zu active server(s) (updated %ld "
+                       "day(s) ago).\n" CLR_RESET,
+             active_servers, age_days);
+    }
+  }
+
+  if (check_only) {
+    DIR *sd = opendir("/var/lib/pacman/sync");
+    if (sd) {
+      time_t newest_db = 0;
+      struct dirent *ent;
+      while ((ent = readdir(sd)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        if (len < 4 || strcmp(ent->d_name + len - 3, ".db") != 0)
+          continue;
+        char p[PATH_MAX];
+        struct stat dst;
+        if (snprintf(p, sizeof(p), "/var/lib/pacman/sync/%s", ent->d_name) <
+                (int)sizeof(p) &&
+            stat(p, &dst) == 0 && dst.st_mtime > newest_db) {
+          newest_db = dst.st_mtime;
+        }
+      }
+      closedir(sd);
+      if (newest_db > 0) {
+        time_t now = time(NULL);
+        long db_days = (now > newest_db) ? (long)((now - newest_db) / 86400) : 0;
+        if (db_days > 14) {
+          printf(CLR_MAGENTA "[i] System sync DBs in /var/lib/pacman/sync are "
+                             "%ld day(s) old.\n" CLR_RESET,
+                 db_days);
+        }
+      }
+    }
   }
 }
 
@@ -891,6 +985,16 @@ void run_alpm_telemetry(int check_only, int has_aur_helper,
   printf("   Installed : %zu packages (%.2f GiB) | Foreign: %zu (%zu AUR "
          "updates)\n",
          total_pkgs, total_gib, foreign_count, aur_updates);
+  if (check_only) {
+    time_t last_up = last_pacman_upgrade_time();
+    if (last_up > 0) {
+      time_t now = time(NULL);
+      long days = (now > last_up) ? (long)((now - last_up) / 86400) : 0;
+      printf("   Last sync : %ld day(s) ago%s\n", days,
+             days > 30 ? " (long gap — review Arch News before upgrading)"
+                       : "");
+    }
+  }
 
   free(foreign);
   alpm_release(handle);

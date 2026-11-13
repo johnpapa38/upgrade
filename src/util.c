@@ -280,6 +280,34 @@ int extract_json_str(const char *start, const char *end, const char *key,
   return -1;
 }
 
+// Parses a pacman.log timestamp prefix `[YYYY-MM-DDTHH:MM:SS+HHMM]` into UTC
+// time_t. Returns 0 on success, -1 on mismatch.
+int parse_pacman_log_ts(const char *line, time_t *out) {
+  if (!line || line[0] != '[')
+    return -1;
+  int y, mo, d, H, M, S, tzh, tzm;
+  char tzs;
+  if (sscanf(line, "[%d-%d-%dT%d:%d:%d%c%2d%2d]", &y, &mo, &d, &H, &M, &S, &tzs,
+             &tzh, &tzm) != 9)
+    return -1;
+  if ((tzs != '+' && tzs != '-') || mo < 1 || mo > 12 || d < 1 || d > 31)
+    return -1;
+  struct tm tm;
+  memset(&tm, 0, sizeof(tm));
+  tm.tm_year = y - 1900;
+  tm.tm_mon = mo - 1;
+  tm.tm_mday = d;
+  tm.tm_hour = H;
+  tm.tm_min = M;
+  tm.tm_sec = S;
+  time_t t = timegm(&tm);
+  if (t == (time_t)-1)
+    return -1;
+  long off = (long)tzh * 3600L + (long)tzm * 60L;
+  *out = (tzs == '-') ? (t + off) : (t - off);
+  return 0;
+}
+
 void str_vec_add_unique(struct str_vec *v, const char *s) {
   for (size_t i = 0; i < v->count; i++) {
     if (strcmp(v->items[i], s) == 0)
@@ -296,6 +324,17 @@ void str_vec_add_unique(struct str_vec *v, const char *s) {
   char *dup = strdup(s);
   if (dup)
     v->items[v->count++] = dup;
+}
+
+void str_vec_free(struct str_vec *v) {
+  if (!v)
+    return;
+  for (size_t i = 0; i < v->count; i++)
+    free(v->items[i]);
+  free(v->items);
+  v->items = NULL;
+  v->count = 0;
+  v->cap = 0;
 }
 
 int cmp_cstr_ptr(const void *a, const void *b) {

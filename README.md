@@ -8,7 +8,8 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
 
 - **Pre-upgrade report, no root needed**
   - Downloads fresh copies of the sync databases into a private folder you own (`/tmp/upgrade-db-<uid>`). Your system's pacman databases are never touched.
-  - Lists pending repo updates and checks every foreign package against the AUR RPC v5 API.
+  - Lists pending repo updates and checks every foreign package against the AUR RPC v5 API, plus previews pending Flatpak and Snap updates in `-c` mode.
+  - Audits `/etc/pacman.d/mirrorlist` (active servers, age, unmerged `.pacnew`) and sync DB staleness.
   - Checks the official **Arch Linux News** feed (`archlinux.org/feeds/news/`) and warns if any advisory was posted since your last upgrade.
   - Flags AUR packages marked out-of-date or orphaned (`Maintainer: null`), as well as foreign packages no longer in the AUR.
   - Respects `IgnorePkg` / `IgnoreGroup` from `/etc/pacman.conf`.
@@ -16,28 +17,28 @@ One command to keep an Arch Linux system fully up to date: official repos, AUR, 
   - Uses your existing sudo login if it's still valid, otherwise asks for your password a single time.
   - Keeps the login fresh in the background, so long AUR builds never stop to ask again.
   - The password is handled entirely by `sudo`; `upgrade` never sees or stores it.
-- **Upgrades everything**
-  - Repo + AUR via `yay` or `paru`, or `sudo pacman -Syu` if neither is installed
-  - Flatpak (system and user installations)
-  - Snap
-- **Cleans up natively (no `pacman-contrib` needed)**
-  - Detects orphaned dependencies directly via `libalpm` (skips cleanup altogether when 0 orphans exist)
-  - Trims both the pacman cache and `~/.cache/yay` / `~/.cache/paru/clone` built `.pkg.tar*` archives in C using `alpm_pkg_vercmp()` (keeps the last 2 versions of installed packages, drops cached tarballs for uninstalled packages, sweeps leftover `download-*` sandbox folders, and leaves `PKGBUILD`s / git clones untouched)
+- **Upgrades everything smoothly**
+  - Clears stale `/var/lib/pacman/db.lck` automatically if its owning process is gone
+  - Runs fully unattended once `sudo` is entered (`--noconfirm --ask=4` for pacman/yay/paru, `-y` for Flatpak) and automatically refreshes keys or falls back to repo updates if an AUR build blocks
+  - Updates Flatpak (system and user installations) and Snap automatically
+- **Cleans up & repairs natively**
+  - Rebuilds outdated foreign/AUR packages automatically when `checkrebuild` (`rebuild-detector`) flags broken shared-library links, and automatically removes any broken AUR package that fails to rebuild
+  - Removes orphaned dependencies directly via `libalpm`
+  - Trims both the pacman cache and `~/.cache/yay` / `~/.cache/paru/clone` built `.pkg.tar*` archives (keeps the last 2 versions of installed packages, drops cached tarballs for uninstalled packages, sweeps leftover `download-*` sandbox folders, and leaves `PKGBUILD`s / git clones untouched)
+  - Audits and vacuums `/var/log/journal` when it exceeds `500 MiB`
   - Removes unused Flatpak runtimes
 - **Pre-upgrade snapshots & package consistency**
   - Creates a rollback snapshot before package transactions via `snapper` or `timeshift` (or integrates automatically with `snap-pac` ALPM hooks)
-  - Rebuild detection for foreign/AUR packages linked against upgraded libraries (`checkrebuild` / `rebuild-detector`)
-  - Upgradable vulnerability and CVE audit via `arch-audit`
-- **Checks system health & prints a built-in C summary (no `fastfetch` needed)**
-  - Pre-flight checks: free disk space on `/`, the package cache, and `/boot` / `/efi` / `/boot/efi`, whether any `/etc/fstab` boot/ESP partition is unmounted or read-only (`ro`), and whether the pacman database is locked
-  - Local package database consistency verification (`pacman -Dkq`) and DKMS kernel module build audit (`dkms status`, when installed)
-  - Native `.pacnew` / `.pacsave` / `.pacorig` scanner via `libalpm` backup metadata + `/etc` walk
-  - Configuration-drift & shadowing audit: flags unmanaged binaries in `/usr/local/bin` or `~/.local/bin` that shadow `/usr/bin` packages, custom `/etc/systemd/system/*.service` copies masking package units, and dangling `.wants` symlinks
-  - Checks both system-wide and `--user` systemd managers for failed and crash-looping (`auto-restart`) services — printing a root-cause trace (`Unit`, `Exec`, filtered `journalctl` error log, plain-English `Why`, and exact `Fix` command) instead of bare unit names — plus current-boot coredump summary (`coredumpctl`) and boot timing (`systemd-analyze`)
-  - Deep hardware health audit: SMART telemetry & wear/temperature for internal NVMe/SATA disks (`smartctl`), EDAC RAM ECC errors, DMI DIMM inventory vs kernel usable memory (`dmidecode`), and storage I/O, filesystem corruption, MCE, or OOM events from the kernel log (`journalctl -k`)
-  - Built-in C system summary card (OS, kernel, uptime + load, CPU, RAM, `/` disk, package counts)
-  - Warns if the kernel was upgraded and a reboot is due
-  - Lists processes (including root daemons) running a deleted executable or holding deleted shared libraries in RAM
+  - Upgradable vulnerability and CVE audit via `arch-audit` (when installed)
+  - Boot & initramfs/UKI integrity audit (`check_boot_integrity`: verifies `/usr/lib/modules/*/modules.dep.bin` and initramfs/UKI images before rebooting)
+- **Checks system health & prints a built-in summary**
+  - Pre-flight checks: free disk space on `/`, the package cache, and `/boot` / `/efi` / `/boot/efi`, `/etc/fstab` boot/ESP mount status, and whether pacman is locked
+  - Local package database consistency (`pacman -Dkq`) and DKMS kernel module audit (`dkms status`)
+  - Scans `.pacnew` / `.pacsave` / `.pacorig` files via `libalpm` backup metadata + `/etc` walk
+  - Audits unmanaged binaries in `/usr/local/bin` or `~/.local/bin` shadowing `/usr/bin`, custom `/etc/systemd/system/*.service` masking package units, and dangling `.wants` symlinks
+  - Checks system-wide and `--user` systemd managers for failed/crash-looping services with root-cause traces, current-boot coredumps, and concise boot timing
+  - Hardware health audit: SMART disk health (`smartctl`), EDAC RAM ECC, DMI DIMM capacity vs usable RAM (`dmidecode`), CPU & GPU thermals (`hwmon` / `nvidia-smi`), Btrfs `device stats` & `fstrim.timer`, and storage/filesystem/MCE/OOM kernel errors (`journalctl -k`)
+  - Built-in C system summary card, kernel/core-package reboot advice, running apps still holding older binaries/libraries, and transaction summary
 
 ## Requirements
 
@@ -74,15 +75,15 @@ Uninstall with `sudo make uninstall`. Change the install location with `PREFIX`,
 ## Usage
 
 ```sh
-up               # (or `upgrade`) full update + cleanup (interactive prompts)
-up -y            # unattended: auto-confirm prompts + conflict replacements
-up -c            # read-only update, package DB, DKMS, service, boot & hardware report
-up --hw          # quick standalone hardware health (SMART, RAM, thermals, kernel) & summary
-up -v            # version
-up -h            # help
+up                  # (or `upgrade`) update everything, clean caches, check health
+up -c               # read-only preview of updates and system health
+up -v               # show version
+up -h               # show help
 ```
 
-Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR helpers and `makepkg` refuse to build as root. `upgrade` asks for sudo rights itself, only for the steps that need them.
+Run `make test` to execute the sanitizer-enabled unit tests.
+
+Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR helpers and `makepkg` refuse to build as root. `up` asks for `sudo` once and keeps it alive for the steps that need it.
 
 ### What a run looks like
 
@@ -97,11 +98,11 @@ Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR hel
 :: [1/8] Synchronizing & upgrading packages (Repo + AUR)...
 :: [2/8] Updating Flatpak apps & runtimes...
 :: [3/8] Refreshing Snap packages...
-:: [4/8] Verifying package database consistency...
+:: [4/8] Verifying package database & rebuilds...
 :: [5/8] Sweeping orphaned dependencies...
-:: [6/8] Cleaning caches (pacman/AUR: keep last 2 versions, drop uninstalled; unused Flatpak runtimes)...
+:: [6/8] Cleaning caches (pacman/AUR, journal & Flatpak)...
 :: [7/8] Scanning for unmerged .pacnew / .pacsave & shadowed paths...
-:: [8/8] Checking systemd system & user service health...
+:: [8/8] Checking system, hardware, boot & running apps...
 
    user@arch
    ---------
@@ -114,14 +115,14 @@ Run it as your **normal user**, not as root and not with `sudo upgrade`. AUR hel
    Packages   1120 (pacman, 18.40 GiB), 14 (flatpak)
 
 [✓] Kernel modules intact (6.x.y-arch1-1) — no immediate reboot required.
-[✓] No processes holding stale binaries or shared libraries.
+[✓] All running apps are up to date.
 ```
 
-Steps for tools you don't have installed are skipped automatically.
+Steps for tools you don't have installed are skipped silently.
 
 ## Notes
 
-- **`-y` / `--yes` & package conflicts:** passes `--noconfirm --ask=4` (`ALPM_QUESTION_CONFLICT_PKG`) to pacman/yay/paru and `-y` to Flatpak, so legitimate repo package replacements swap atomically inside the transaction without blindly removing dependency trees. If `-y` still hits an unresolvable dependency conflict while running in a terminal, `upgrade` automatically retries `-Syu` interactively so you can inspect and decide. Read the [Arch news](https://archlinux.org/news/) (also checked automatically before upgrading) for manual-intervention notices.
+- **100% automatic once `sudo` is entered:** `up` passes `--noconfirm --ask=4` (`ALPM_QUESTION_CONFLICT_PKG`) to pacman/yay/paru and `-y` to Flatpak so replacements happen automatically without prompting. If an update fails due to keys or a flaky AUR build, `up` refreshes `archlinux-keyring` and falls back to upgrading official packages cleanly; broken AUR packages that fail `checkrebuild` are automatically removed. Read the [Arch news](https://archlinux.org/news/) (checked automatically before upgrading) if an advisory appears.
 - **No signature checks in the report:** the copies of the databases used by `-c` and the pre-upgrade report aren't signature-checked, because root's keyring can't be used without root. They are only used for displaying updates. The real upgrade runs pacman as root with full signature checks.
 - **Privacy:** the AUR check sends the names of your foreign (non-repo) packages to `aur.archlinux.org`.
 - **Logging:** output stays in the correct order when piped, e.g. `upgrade | tee ~/upgrade.log`.

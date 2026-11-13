@@ -282,13 +282,8 @@ static void report_disk(const char *label, int rotational, const char *out) {
   struct smart_info si;
   parse_smart_output(out, &si);
 
-  if (!si.seen) {
-    printf(CLR_YELLOW "[!] %s: no SMART data (needs root — try `sudo -v` "
-                      "first — or the device/USB bridge doesn't expose "
-                      "it).\n" CLR_RESET,
-           label);
+  if (!si.seen)
     return;
-  }
 
   int sev = 0; // 0 ok, 1 warn, 2 bad
   char issues[5][112];
@@ -388,15 +383,8 @@ static void check_disks_smart(void) {
   closedir(d);
   qsort(names, (size_t)count, sizeof(names[0]), cmp_name32);
 
-  if (count == 0) {
-    printf(CLR_MAGENTA "[i] No internal SATA/NVMe disks found.\n" CLR_RESET);
+  if (count == 0 || !have_cmd("smartctl"))
     return;
-  }
-  if (!have_cmd("smartctl")) {
-    printf(CLR_MAGENTA "[i] SMART checks skipped: smartctl not installed "
-                       "(pacman -S smartmontools).\n" CLR_RESET);
-    return;
-  }
 
   int root = (geteuid() == 0);
   for (int i = 0; i < count; i++) {
@@ -492,11 +480,8 @@ static void check_dimm_inventory(unsigned long long mem_total_kb) {
     char *const cmd[] = {"sudo", "-n", "dmidecode", "-t", "memory", NULL};
     n = capture_cmd_output(cmd, out, sizeof(out), &rc);
   }
-  if (n <= 0 || rc != 0) {
-    printf(CLR_MAGENTA "[i] DIMM inventory skipped (dmidecode needs root — "
-                       "try `sudo -v` first).\n" CLR_RESET);
+  if (n <= 0 || rc != 0)
     return;
-  }
 
   unsigned long long installed_mb = 0;
   int dimms = 0;
@@ -560,25 +545,23 @@ static void check_ram_health(void) {
   unsigned long long ce = 0, ue = 0;
   int mcs = edac_sum("ce_count", &ce);
   edac_sum("ue_count", &ue);
-  if (mcs <= 0) {
-    printf(CLR_MAGENTA "[i] RAM: no EDAC memory controller exposed (non-ECC "
-                       "board, or driver not loaded — e.g. sb_edac on Xeon "
-                       "E5) — ECC errors can't be monitored.\n" CLR_RESET);
-  } else if (ue > 0) {
-    printf(CLR_RED "[!] RAM ECC: %llu UNCORRECTABLE and %llu corrected "
-                   "error(s) across %d controller(s).\n" CLR_RESET,
-           ue, ce, mcs);
-    problems++;
-  } else if (ce > 0) {
-    printf(CLR_YELLOW "[!] RAM ECC: %llu corrected error(s) across %d "
-                      "controller(s) — a DIMM is degrading (find which with "
-                      "`ras-mc-ctl --error-count`).\n" CLR_RESET,
-           ce, mcs);
-    problems++;
-  } else {
-    printf(CLR_GREEN "[✓] RAM ECC: 0 corrected / 0 uncorrectable errors "
-                     "(%d controller(s)).\n" CLR_RESET,
-           mcs);
+  if (mcs > 0) {
+    if (ue > 0) {
+      printf(CLR_RED "[!] RAM ECC: %llu UNCORRECTABLE and %llu corrected "
+                     "error(s) across %d controller(s).\n" CLR_RESET,
+             ue, ce, mcs);
+      problems++;
+    } else if (ce > 0) {
+      printf(CLR_YELLOW "[!] RAM ECC: %llu corrected error(s) across %d "
+                        "controller(s) — a DIMM is degrading (find which with "
+                        "`ras-mc-ctl --error-count`).\n" CLR_RESET,
+             ce, mcs);
+      problems++;
+    } else {
+      printf(CLR_GREEN "[✓] RAM ECC: 0 corrected / 0 uncorrectable errors "
+                       "(%d controller(s)).\n" CLR_RESET,
+             mcs);
+    }
   }
 
   if (mem_total_kb > 0)
@@ -720,6 +703,94 @@ static void check_cpu_thermals(void) {
   }
 }
 
+static void check_gpu_thermals(void) {
+  int reported = 0;
+
+  DIR *hd = opendir("/sys/class/hwmon");
+  if (hd) {
+    struct dirent *ent;
+    while ((ent = readdir(hd)) != NULL) {
+      if (ent->d_name[0] == '.')
+        continue;
+      char name_path[PATH_MAX], sensor_name[64] = "";
+      snprintf(name_path, sizeof(name_path), "/sys/class/hwmon/%s/name",
+               ent->d_name);
+      if (read_small_file(name_path, sensor_name, sizeof(sensor_name)) != 0)
+        continue;
+      if (strcmp(sensor_name, "amdgpu") != 0 &&
+          strcmp(sensor_name, "radeon") != 0 &&
+          strcmp(sensor_name, "nouveau") != 0)
+        continue;
+
+      char tpath[PATH_MAX], tbuf[32];
+      snprintf(tpath, sizeof(tpath), "/sys/class/hwmon/%s/temp1_input",
+               ent->d_name);
+      if (read_small_file(tpath, tbuf, sizeof(tbuf)) != 0) {
+        snprintf(tpath, sizeof(tpath), "/sys/class/hwmon/%s/temp2_input",
+                 ent->d_name);
+        if (read_small_file(tpath, tbuf, sizeof(tbuf)) != 0)
+          continue;
+      }
+      long millic = strtol(tbuf, NULL, 10);
+      if (millic <= 0 || millic >= 150000)
+        continue;
+
+      double degc = (double)millic / 1000.0;
+      if (degc >= 95.0) {
+        printf(CLR_RED "[!] GPU thermals: %.1f°C (%s — running very hot!)\n"
+                       CLR_RESET,
+               degc, sensor_name);
+      } else if (degc >= 85.0) {
+        printf(CLR_YELLOW "[!] GPU thermals: %.1f°C (%s — running warm)\n"
+                          CLR_RESET,
+               degc, sensor_name);
+      } else {
+        printf(CLR_GREEN "[✓] GPU thermals: %.1f°C (%s).\n" CLR_RESET, degc,
+               sensor_name);
+      }
+      reported = 1;
+    }
+    closedir(hd);
+  }
+
+  if (!reported && have_cmd("nvidia-smi")) {
+    char out[512];
+    int rc = -1;
+    char *const cmd[] = {"nvidia-smi",
+                         "--query-gpu=name,temperature.gpu",
+                         "--format=csv,noheader,nounits", NULL};
+    if (capture_cmd_output(cmd, out, sizeof(out), &rc) > 0 && rc == 0) {
+      for (const char *p = out; *p != '\0';) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        char line[160];
+        snprintf(line, sizeof(line), "%.*s", (int)len, p);
+        p = nl ? nl + 1 : p + len;
+
+        char *comma = strrchr(line, ',');
+        if (!comma)
+          continue;
+        *comma = '\0';
+        long long degc = 0;
+        if (!parse_first_int(comma + 1, &degc))
+          continue;
+        if (degc >= 95) {
+          printf(CLR_RED "[!] GPU thermals: %lld°C (%s — running very hot!)\n"
+                         CLR_RESET,
+                 degc, line);
+        } else if (degc >= 85) {
+          printf(CLR_YELLOW "[!] GPU thermals: %lld°C (%s — running warm)\n"
+                            CLR_RESET,
+                 degc, line);
+        } else {
+          printf(CLR_GREEN "[✓] GPU thermals: %lld°C (%s).\n" CLR_RESET, degc,
+                 line);
+        }
+      }
+    }
+  }
+}
+
 // ---- ext4 superblock errors, mdadm RAID & laptop battery health ------------
 
 static void check_fs_raid_battery(int check_only) {
@@ -836,11 +907,129 @@ static void check_fs_raid_battery(int check_only) {
     }
     closedir(pd);
   }
+
+  // 4. Check Btrfs device I/O & corruption stats (deduplicated by dev major:minor)
+  if (have_cmd("btrfs")) {
+    FILE *mp = fopen("/proc/self/mountinfo", "r");
+    if (mp) {
+      char seen_devs[16][32];
+      int seen_cnt = 0;
+      char line[1024];
+      while (fgets(line, sizeof(line), mp)) {
+        char devid[32], mnt[512], fstype[64];
+        if (sscanf(line, "%*s %*s %31s %*s %511s", devid, mnt) != 2)
+          continue;
+        const char *sep = strstr(line, " - ");
+        if (!sep || sscanf(sep + 3, "%63s", fstype) != 1 ||
+            strcmp(fstype, "btrfs") != 0)
+          continue;
+
+        int dup = 0;
+        for (int i = 0; i < seen_cnt; i++) {
+          if (strcmp(seen_devs[i], devid) == 0) {
+            dup = 1;
+            break;
+          }
+        }
+        if (dup || seen_cnt >= 16)
+          continue;
+        snprintf(seen_devs[seen_cnt++], sizeof(seen_devs[0]), "%s", devid);
+
+        char bout[4096];
+        int brc = -1;
+        ssize_t bn;
+        if (geteuid() == 0) {
+          char *const bcmd[] = {"btrfs", "device", "stats", mnt, NULL};
+          bn = capture_cmd_output(bcmd, bout, sizeof(bout), &brc);
+        } else {
+          char *const bcmd[] = {"sudo", "-n", "btrfs", "device", "stats", mnt,
+                                NULL};
+          bn = capture_cmd_output(bcmd, bout, sizeof(bout), &brc);
+        }
+        if (bn <= 0 || brc != 0)
+          continue;
+
+        unsigned long long errs = 0;
+        for (const char *p = bout; *p != '\0';) {
+          const char *nl = strchr(p, '\n');
+          size_t len = nl ? (size_t)(nl - p) : strlen(p);
+          char bline[256];
+          snprintf(bline, sizeof(bline), "%.*s", (int)len, p);
+          p = nl ? nl + 1 : p + len;
+
+          if (strstr(bline, "_errs")) {
+            const char *sp = strrchr(bline, ' ');
+            if (sp)
+              errs += strtoull(sp + 1, NULL, 10);
+          }
+        }
+        if (errs > 0) {
+          printf(CLR_RED "[!] Filesystem btrfs (%s): %llu device/corruption "
+                         "error(s) — run `btrfs device stats %s`!\n" CLR_RESET,
+                 mnt, errs, mnt);
+        } else {
+          printf(CLR_GREEN "[✓] Filesystem btrfs (%s): 0 device I/O or "
+                           "corruption errors.\n" CLR_RESET,
+                 mnt);
+        }
+      }
+      fclose(mp);
+    }
+  }
+
+  // 5. Check fstrim.timer when non-rotational disks exist without `discard`
+  if (check_only && access("/run/systemd/system", F_OK) == 0 &&
+      have_cmd("systemctl")) {
+    int has_ssd = 0;
+    DIR *bd = opendir("/sys/block");
+    if (bd) {
+      struct dirent *ent;
+      while ((ent = readdir(bd)) != NULL) {
+        if (strncmp(ent->d_name, "nvme", 4) != 0 &&
+            strncmp(ent->d_name, "sd", 2) != 0)
+          continue;
+        char rpath[PATH_MAX], rot[8] = "";
+        snprintf(rpath, sizeof(rpath), "/sys/block/%s/queue/rotational",
+                 ent->d_name);
+        if (read_small_file(rpath, rot, sizeof(rot)) == 0 && rot[0] == '0') {
+          has_ssd = 1;
+          break;
+        }
+      }
+      closedir(bd);
+    }
+
+    int has_discard = 0;
+    FILE *mp = fopen("/proc/self/mountinfo", "r");
+    if (mp) {
+      char line[1024];
+      while (fgets(line, sizeof(line), mp)) {
+        if (strstr(line, "discard")) {
+          has_discard = 1;
+          break;
+        }
+      }
+      fclose(mp);
+    }
+
+    if (has_ssd && !has_discard) {
+      char dummy[64];
+      int trc = -1;
+      char *const tcmd[] = {"systemctl", "is-enabled", "--quiet",
+                            "fstrim.timer", NULL};
+      capture_cmd_output(tcmd, dummy, sizeof(dummy), &trc);
+      if (trc != 0) {
+        printf(CLR_MAGENTA "[i] SSD detected without fstrim.timer enabled "
+                           "(enable with `sudo systemctl enable --now "
+                           "fstrim.timer`).\n" CLR_RESET);
+      }
+    }
+  }
 }
 
 // ---- kernel log: storage / filesystem / machine-check / OOM -----------------
 
-static void check_kernel_hw_errors(void) {
+static void check_kernel_hw_errors(int check_only) {
   if (!have_cmd("journalctl"))
     return;
 
@@ -851,9 +1040,14 @@ static void check_kernel_hw_errors(void) {
   int rc = -1;
   char *const cmd[] = {"journalctl", "-k", "-b",    "-p", "err", "-o",
                        "cat",        "--no-pager", "-n", "4000", NULL};
-  if (capture_cmd_output(cmd, buf, cap, &rc) < 0 || rc != 0) {
-    printf(CLR_MAGENTA "[i] Kernel log unreadable (join the systemd-journal "
-                       "or wheel group to enable this check).\n" CLR_RESET);
+  ssize_t got = capture_cmd_output(cmd, buf, cap, &rc);
+  if ((got < 0 || rc != 0) && !check_only && geteuid() != 0) {
+    char *const scmd[] = {"sudo",       "-n", "journalctl", "-k", "-b", "-p",
+                          "err",        "-o", "cat", "--no-pager", "-n", "4000",
+                          NULL};
+    got = capture_cmd_output(scmd, buf, cap, &rc);
+  }
+  if (got < 0 || rc != 0) {
     free(buf);
     return;
   }
@@ -919,7 +1113,8 @@ void check_hardware_health(int check_only) {
   check_disks_smart();
   check_ram_health();
   check_cpu_thermals();
+  check_gpu_thermals();
   check_fs_raid_battery(check_only);
-  check_kernel_hw_errors();
+  check_kernel_hw_errors(check_only);
 }
 

@@ -1,5 +1,78 @@
 #include "upgrade.h"
 
+static void check_core_pkg_reboot_hints(const char *kver) {
+  static const char *const core_pkgs[] = {
+      "systemd",       "glibc",       "dbus",       "dbus-broker",
+      "linux-firmware", "amd-ucode",  "intel-ucode", "mesa",
+      "nvidia",        "nvidia-dkms", "nvidia-open", "nvidia-open-dkms",
+      "cryptsetup",    "mkinitcpio",  "wayland",     "xorg-server"};
+  struct sysinfo si;
+  if (sysinfo(&si) != 0) {
+    printf(CLR_GREEN "\n[✓] Kernel modules intact (%s) — no immediate reboot "
+                     "required.\n" CLR_RESET,
+           kver);
+    return;
+  }
+  time_t boot_ts = time(NULL) - (time_t)si.uptime;
+
+  FILE *fp = fopen("/var/log/pacman.log", "r");
+  struct str_vec hits = {NULL, 0, 0};
+  if (fp) {
+    if (fseek(fp, 0, SEEK_END) == 0) {
+      long end = ftell(fp);
+      if (end > 262144) {
+        fseek(fp, end - 262144, SEEK_SET);
+        char discard[512];
+        if (!fgets(discard, sizeof(discard), fp)) {
+          fclose(fp);
+          fp = NULL;
+        }
+      } else {
+        rewind(fp);
+      }
+    }
+    if (fp) {
+      char line[512];
+      while (fgets(line, sizeof(line), fp)) {
+        time_t ts = 0;
+        if (parse_pacman_log_ts(line, &ts) != 0 || ts < boot_ts)
+          continue;
+        const char *up = strstr(line, "[ALPM] upgraded ");
+        if (!up)
+          continue;
+        const char *pkg = up + 16;
+        char name[128];
+        size_t ni = 0;
+        while (pkg[ni] != '\0' && pkg[ni] != ' ' && pkg[ni] != '\t' &&
+               ni + 1 < sizeof(name)) {
+          name[ni] = pkg[ni];
+          ni++;
+        }
+        name[ni] = '\0';
+        for (size_t i = 0; i < sizeof(core_pkgs) / sizeof(core_pkgs[0]); i++) {
+          if (strcmp(name, core_pkgs[i]) == 0) {
+            str_vec_add_unique(&hits, name);
+            break;
+          }
+        }
+      }
+      fclose(fp);
+    }
+  }
+
+  if (hits.count > 0) {
+    printf(CLR_YELLOW "\n[!] Core package(s) upgraded since boot (");
+    for (size_t i = 0; i < hits.count; i++)
+      printf("%s%s", i == 0 ? "" : ", ", hits.items[i]);
+    printf(") — reboot recommended when convenient.\n" CLR_RESET);
+  } else {
+    printf(CLR_GREEN "\n[✓] Kernel modules intact (%s) — no immediate reboot "
+                     "required.\n" CLR_RESET,
+           kver);
+  }
+  str_vec_free(&hits);
+}
+
 // Checks whether the currently running kernel's module directory
 // (/lib/modules/$(uname -r)) still exists on disk. On Arch Linux, upgrading
 // the `linux` package removes the old kernel's modules immediately, meaning a
@@ -19,9 +92,7 @@ void check_kernel_reboot(void) {
                    "kernel modules.\n" CLR_RESET,
            uts.release);
   } else {
-    printf(CLR_GREEN "\n[✓] Kernel modules intact (%s) — no immediate reboot "
-                     "required.\n" CLR_RESET,
-           uts.release);
+    check_core_pkg_reboot_hints(uts.release);
   }
 }
 
@@ -35,9 +106,7 @@ void check_stale_libs(void) {
 
   struct dirent *ent;
   int stale_count = 0;
-  int hidden = 0; // Processes we lack permission to inspect (EACCES)
   pid_t self = getpid();
-  int as_root = (geteuid() == 0);
   char seen_comms[64][64];
   int seen_count = 0;
 
@@ -79,11 +148,8 @@ void check_stale_libs(void) {
       snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)pid);
 
       FILE *fp = fopen(maps_path, "r");
-      if (!fp) {
-        if (errno == EACCES)
-          hidden++;
+      if (!fp)
         continue;
-      }
 
       char line[1024];
       while (fgets(line, sizeof(line), fp)) {
@@ -128,26 +194,159 @@ void check_stale_libs(void) {
       }
 
       if (stale_count == 0) {
-        printf(CLR_YELLOW "\n[!] %s processes running deleted binaries or "
-                          "shared libraries in RAM:\n" CLR_RESET,
-               as_root ? "System/user" : "User");
+        printf(CLR_YELLOW "\n[!] Apps still running an older version "
+                          "(restart when convenient):\n" CLR_RESET);
       }
-      printf("    - %-18s (PID %-6d) -> %s\n", comm, (int)pid, deleted_lib);
+      printf("    - %s\n", comm);
       stale_count++;
     }
   }
   closedir(proc);
 
   if (stale_count == 0) {
-    printf(CLR_GREEN "[✓] No %sprocesses holding stale binaries or shared "
-                     "libraries.\n" CLR_RESET,
-           as_root ? "" : "user ");
+    printf(CLR_GREEN "[✓] All running apps are up to date.\n" CLR_RESET);
   }
-  if (hidden > 0) {
-    printf(CLR_MAGENTA "    (%d processes owned by other users/root were not "
-                       "inspected — needs root)\n" CLR_RESET,
-           hidden);
+}
+
+static void norm_hex4(const char *raw, char out[5]) {
+  const char *p = raw;
+  if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+    p += 2;
+  size_t i = 0;
+  for (; i < 4 && isxdigit((unsigned char)p[i]); i++)
+    out[i] = (char)tolower((unsigned char)p[i]);
+  out[i] = '\0';
+}
+
+static const char *short_pci_vendor(const char *ven4) {
+  if (strcmp(ven4, "1002") == 0)
+    return "AMD";
+  if (strcmp(ven4, "10de") == 0)
+    return "NVIDIA";
+  if (strcmp(ven4, "8086") == 0)
+    return "Intel";
+  if (strcmp(ven4, "1af4") == 0)
+    return "VirtIO";
+  if (strcmp(ven4, "15ad") == 0)
+    return "VMware";
+  if (strcmp(ven4, "1234") == 0)
+    return "QEMU";
+  return NULL;
+}
+
+static void lookup_pci_names(const char *ven4, const char *dev4, char *ven_out,
+                             size_t ven_sz, char *dev_out, size_t dev_sz) {
+  ven_out[0] = '\0';
+  dev_out[0] = '\0';
+  const char *sv = short_pci_vendor(ven4);
+  if (sv)
+    snprintf(ven_out, ven_sz, "%s", sv);
+
+  FILE *fp = fopen("/usr/share/hwdata/pci.ids", "r");
+  if (!fp)
+    return;
+
+  char line[512];
+  int in_vendor = 0;
+  while (fgets(line, sizeof(line), fp)) {
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+      continue;
+    if (!in_vendor) {
+      if (line[0] != '\t' && strncmp(line, ven4, 4) == 0 && line[4] == ' ') {
+        in_vendor = 1;
+        if (ven_out[0] == '\0') {
+          const char *vn = line + 5;
+          while (*vn == ' ')
+            vn++;
+          snprintf(ven_out, ven_sz, "%.*s", (int)(ven_sz - 1), vn);
+          ven_out[strcspn(ven_out, "\r\n")] = '\0';
+        }
+      }
+    } else {
+      if (line[0] != '\t')
+        break;
+      if (line[1] != '\t' && strncmp(line + 1, dev4, 4) == 0 &&
+          line[5] == ' ') {
+        const char *dn = line + 6;
+        while (*dn == ' ')
+          dn++;
+        snprintf(dev_out, dev_sz, "%.*s", (int)(dev_sz - 1), dn);
+        dev_out[strcspn(dev_out, "\r\n")] = '\0';
+        break;
+      }
+    }
   }
+  fclose(fp);
+}
+
+static void detect_gpu_summary(char *out, size_t out_sz) {
+  out[0] = '\0';
+  DIR *d = opendir("/sys/class/drm");
+  if (!d)
+    return;
+
+  size_t pos = 0;
+  int gpu_cnt = 0;
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL && gpu_cnt < 2) {
+    if (strncmp(ent->d_name, "card", 4) != 0 ||
+        !isdigit((unsigned char)ent->d_name[4]) ||
+        strchr(ent->d_name, '-') != NULL)
+      continue;
+
+    char vpath[PATH_MAX], dpath[PATH_MAX], drpath[PATH_MAX];
+    char vraw[32] = "", draw[32] = "", drv[64] = "";
+    snprintf(vpath, sizeof(vpath), "/sys/class/drm/%s/device/vendor",
+             ent->d_name);
+    snprintf(dpath, sizeof(dpath), "/sys/class/drm/%s/device/device",
+             ent->d_name);
+    snprintf(drpath, sizeof(drpath), "/sys/class/drm/%s/device/driver",
+             ent->d_name);
+
+    char linkbuf[PATH_MAX];
+    ssize_t llen = readlink(drpath, linkbuf, sizeof(linkbuf) - 1);
+    if (llen > 0) {
+      linkbuf[llen] = '\0';
+      const char *base = strrchr(linkbuf, '/');
+      snprintf(drv, sizeof(drv), "%.63s", base ? base + 1 : linkbuf);
+    }
+
+    char ven4[5] = "", dev4[5] = "";
+    if (read_small_file(vpath, vraw, sizeof(vraw)) == 0)
+      norm_hex4(vraw, ven4);
+    if (read_small_file(dpath, draw, sizeof(draw)) == 0)
+      norm_hex4(draw, dev4);
+
+    if (ven4[0] == '\0' && drv[0] == '\0')
+      continue;
+
+    char ven_name[96] = "", dev_name[160] = "";
+    if (strlen(ven4) == 4 && strlen(dev4) == 4)
+      lookup_pci_names(ven4, dev4, ven_name, sizeof(ven_name), dev_name,
+                       sizeof(dev_name));
+
+    char entry[352];
+    if (ven_name[0] && dev_name[0] && drv[0])
+      snprintf(entry, sizeof(entry), "%s %s (%s)", ven_name, dev_name, drv);
+    else if (ven_name[0] && dev_name[0])
+      snprintf(entry, sizeof(entry), "%s %s", ven_name, dev_name);
+    else if (ven_name[0] && drv[0])
+      snprintf(entry, sizeof(entry), "%s [%s] (%s)", ven_name, dev4, drv);
+    else if (drv[0])
+      snprintf(entry, sizeof(entry), "%s", drv);
+    else
+      continue;
+
+    if (pos + 4 >= out_sz)
+      break;
+    int max_w = (int)(out_sz - pos - (gpu_cnt == 0 ? 1 : 3));
+    int w = snprintf(out + pos, out_sz - pos, "%s%.*s", gpu_cnt == 0 ? "" : ", ",
+                     max_w, entry);
+    if (w > 0 && pos + (size_t)w < out_sz)
+      pos += (size_t)w;
+    gpu_cnt++;
+  }
+  closedir(d);
 }
 
 static size_t count_subdirs(const char *dir) {
@@ -223,19 +422,25 @@ void print_sys_summary(void) {
   }
   long threads = sysconf(_SC_NPROCESSORS_ONLN);
 
-  // Memory usage from /proc/meminfo
+  // Memory & swap usage from /proc/meminfo
   unsigned long long mem_total_kb = 0, mem_avail_kb = 0;
+  unsigned long long swap_total_kb = 0, swap_free_kb = 0;
   FILE *mem_fp = fopen("/proc/meminfo", "r");
   if (mem_fp) {
     char line[128];
     while (fgets(line, sizeof(line), mem_fp)) {
       sscanf(line, "MemTotal: %llu kB", &mem_total_kb);
       sscanf(line, "MemAvailable: %llu kB", &mem_avail_kb);
-      if (mem_total_kb && mem_avail_kb)
+      sscanf(line, "SwapTotal: %llu kB", &swap_total_kb);
+      sscanf(line, "SwapFree: %llu kB", &swap_free_kb);
+      if (mem_total_kb && mem_avail_kb && swap_total_kb && swap_free_kb)
         break;
     }
     fclose(mem_fp);
   }
+
+  char gpu_info[256];
+  detect_gpu_summary(gpu_info, sizeof(gpu_info));
 
   // Uptime & load average via sysinfo()
   struct sysinfo si;
@@ -267,6 +472,19 @@ void print_sys_summary(void) {
         (int)sizeof(ufp))
       flatpak_pkgs += count_subdirs(ufp);
   }
+  size_t snap_pkgs = 0;
+  DIR *sd = opendir("/var/lib/snapd/snap");
+  if (!sd)
+    sd = opendir("/snap");
+  if (sd) {
+    struct dirent *sent;
+    while ((sent = readdir(sd)) != NULL) {
+      if (sent->d_name[0] != '.' && strcmp(sent->d_name, "bin") != 0 &&
+          strcmp(sent->d_name, "README") != 0)
+        snap_pkgs++;
+    }
+    closedir(sd);
+  }
 
   printf("\n" CLR_CYAN "   %s@%s" CLR_RESET "\n   ", user, uts.nodename);
   size_t hlen = strlen(user) + 1 + strlen(uts.nodename);
@@ -291,11 +509,20 @@ void print_sys_summary(void) {
   else
     printf("   " CLR_CYAN "%-10s" CLR_RESET " %s\n", "CPU", cpu_model);
 
+  if (gpu_info[0] != '\0')
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %s\n", "GPU", gpu_info);
+
   if (mem_total_kb > 0) {
     double tot = (double)mem_total_kb / (1024.0 * 1024.0);
     double used = (double)(mem_total_kb - mem_avail_kb) / (1024.0 * 1024.0);
     printf("   " CLR_CYAN "%-10s" CLR_RESET " %.2f / %.2f GiB (%.0f%%)\n",
            "Memory", used, tot, (used / tot) * 100.0);
+  }
+  if (swap_total_kb > 0) {
+    double stot = (double)swap_total_kb / (1024.0 * 1024.0);
+    double sused = (double)(swap_total_kb - swap_free_kb) / (1024.0 * 1024.0);
+    printf("   " CLR_CYAN "%-10s" CLR_RESET " %.2f / %.2f GiB (%.0f%%)\n",
+           "Swap", sused, stot, (sused / stot) * 100.0);
   }
 
   struct statvfs vfs;
@@ -312,12 +539,137 @@ void print_sys_summary(void) {
   }
 
   double pkg_gib = (double)pacman_bytes / (1024.0 * 1024.0 * 1024.0);
-  if (flatpak_pkgs > 0) {
-    printf("   " CLR_CYAN "%-10s" CLR_RESET
-           " %zu (pacman, %.2f GiB), %zu (flatpak)\n",
-           "Packages", pacman_pkgs, pkg_gib, flatpak_pkgs);
-  } else {
-    printf("   " CLR_CYAN "%-10s" CLR_RESET " %zu (pacman, %.2f GiB)\n",
-           "Packages", pacman_pkgs, pkg_gib);
+  printf("   " CLR_CYAN "%-10s" CLR_RESET " %zu (pacman, %.2f GiB)",
+         "Packages", pacman_pkgs, pkg_gib);
+  if (flatpak_pkgs > 0)
+    printf(", %zu (flatpak)", flatpak_pkgs);
+  if (snap_pkgs > 0)
+    printf(", %zu (snap)", snap_pkgs);
+  putchar('\n');
+}
+
+off_t get_pacman_log_offset(void) {
+  struct stat st;
+  if (stat("/var/log/pacman.log", &st) != 0)
+    return -1;
+  return st.st_size;
+}
+
+static int is_notable_pkg(const char *pkg) {
+  static const char *const notable[] = {
+      "linux",          "linux-lts",     "linux-zen",      "linux-hardened",
+      "linux-cachyos",  "systemd",       "glibc",          "pacman",
+      "mesa",           "nvidia",        "nvidia-dkms",    "nvidia-open",
+      "nvidia-open-dkms", "dbus",        "dbus-broker",    "linux-firmware",
+      "amd-ucode",      "intel-ucode",   "cryptsetup",     "mkinitcpio"};
+  for (size_t i = 0; i < sizeof(notable) / sizeof(notable[0]); i++) {
+    if (strcmp(pkg, notable[i]) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+void parse_pacman_log_delta_buf(const char *buf, struct tx_summary *out) {
+  memset(out, 0, sizeof(*out));
+  if (!buf)
+    return;
+
+  struct str_vec notable_vec = {NULL, 0, 0};
+  const char *p = buf;
+  while (*p != '\0') {
+    const char *nl = strchr(p, '\n');
+    size_t len = nl ? (size_t)(nl - p) : strlen(p);
+    char line[512];
+    if (len > 0) {
+      snprintf(line, sizeof(line), "%.*s",
+               len >= sizeof(line) ? (int)sizeof(line) - 1 : (int)len, p);
+      const char *alpm = strstr(line, "[ALPM] ");
+      if (alpm) {
+        const char *act = alpm + 7;
+        const char *pkg = NULL;
+        if (strncmp(act, "upgraded ", 9) == 0) {
+          out->upgraded++;
+          pkg = act + 9;
+        } else if (strncmp(act, "installed ", 10) == 0) {
+          out->installed++;
+          pkg = act + 10;
+        } else if (strncmp(act, "removed ", 8) == 0) {
+          out->removed++;
+          pkg = act + 8;
+        }
+        if (pkg) {
+          char name[128];
+          size_t ni = 0;
+          while (pkg[ni] != '\0' && pkg[ni] != ' ' && pkg[ni] != '\t' &&
+                 ni + 1 < sizeof(name)) {
+            name[ni] = pkg[ni];
+            ni++;
+          }
+          name[ni] = '\0';
+          if (name[0] != '\0' && is_notable_pkg(name))
+            str_vec_add_unique(&notable_vec, name);
+        }
+      }
+    }
+    if (!nl)
+      break;
+    p = nl + 1;
+  }
+
+  size_t pos = 0;
+  for (size_t i = 0; i < notable_vec.count; i++) {
+    int w = snprintf(out->notable + pos, sizeof(out->notable) - pos, "%s%s",
+                     i == 0 ? "" : ", ", notable_vec.items[i]);
+    if (w < 0 || pos + (size_t)w >= sizeof(out->notable))
+      break;
+    pos += (size_t)w;
+  }
+  str_vec_free(&notable_vec);
+}
+
+void summarize_pacman_log_delta(off_t start_offset, struct tx_summary *out) {
+  memset(out, 0, sizeof(*out));
+  if (start_offset < 0)
+    return;
+
+  FILE *fp = fopen("/var/log/pacman.log", "r");
+  if (!fp)
+    return;
+  if (fseeko(fp, start_offset, SEEK_SET) != 0) {
+    fclose(fp);
+    return;
+  }
+
+  size_t cap = 4096, used = 0;
+  char *buf = malloc(cap);
+  if (!buf) {
+    fclose(fp);
+    return;
+  }
+  size_t n;
+  while ((n = fread(buf + used, 1, cap - used - 1, fp)) > 0) {
+    used += n;
+    if (cap - used <= 1) {
+      if (cap >= 4U * 1024U * 1024U)
+        break;
+      char *tmp = realloc(buf, cap * 2);
+      if (!tmp)
+        break;
+      buf = tmp;
+      cap *= 2;
+    }
+  }
+  buf[used] = '\0';
+  fclose(fp);
+
+  parse_pacman_log_delta_buf(buf, out);
+  free(buf);
+
+  if (out->upgraded + out->installed + out->removed > 0) {
+    printf(CLR_GREEN "\n[✓] Transaction summary: %zu upgraded, %zu installed, "
+                     "%zu removed.\n" CLR_RESET,
+           out->upgraded, out->installed, out->removed);
+    if (out->notable[0] != '\0')
+      printf("    Notable core packages: %s\n", out->notable);
   }
 }

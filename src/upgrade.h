@@ -26,7 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define UPGRADE_VERSION "3.0.0"
+#define UPGRADE_VERSION "3.2.0"
 
 // ANSI escape sequences for terminal color output
 #define CLR_CYAN "\033[1;36m"
@@ -62,6 +62,14 @@ struct str_vec {
   size_t cap;
 };
 
+// Summary of package changes parsed from /var/log/pacman.log delta
+struct tx_summary {
+  size_t upgraded;
+  size_t installed;
+  size_t removed;
+  char notable[256];
+};
+
 // ---- util.c -----------------------------------------------------------------
 int run_cmd(char *const argv[]);
 ssize_t capture_cmd_output(char *const argv[], char *buf, size_t buf_sz,
@@ -79,8 +87,10 @@ const char *line_after(const char *line, const char *key);
 int read_small_file(const char *path, char *buf, size_t sz);
 int extract_json_str(const char *start, const char *end, const char *key,
                      char *out, size_t out_sz);
+int parse_pacman_log_ts(const char *line, time_t *out);
 
 void str_vec_add_unique(struct str_vec *v, const char *s);
+void str_vec_free(struct str_vec *v);
 int cmp_cstr_ptr(const void *a, const void *b);
 
 size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp);
@@ -90,11 +100,12 @@ void stop_sudo_keepalive(void);
 // ---- telemetry.c ------------------------------------------------------------
 int check_pacman_lock(int check_only);
 void check_pacman_keyring(void);
+void check_mirrorlist_health(int check_only);
 void run_alpm_telemetry(int check_only, int has_aur_helper,
                         int *keyring_needs_update);
 
 // ---- cache.c ----------------------------------------------------------------
-void sweep_orphans(const char *aur_helper, int auto_yes);
+void sweep_orphans(const char *aur_helper);
 void clean_pacman_cache(void);
 void clean_aur_cache(void);
 void clean_systemd_journal(int check_only);
@@ -103,11 +114,15 @@ void clean_systemd_journal(int check_only);
 void check_package_database(void);
 void check_dkms_status(void);
 void check_arch_audit(void);
-void check_rebuilds(void);
-void scan_pacnew_files(void);
+size_t parse_checkrebuild_foreign(const char *buf, struct str_vec *out);
+void check_rebuilds(const char *aur_helper, int check_only);
+void check_firmware_updates(void);
+void check_flatpak_updates(void);
+void check_snap_updates(void);
+void check_boot_integrity(void);
+size_t scan_pacnew_files(void);
 void check_shadowed_paths(void);
 void pre_upgrade_snapshot(int check_only);
-void check_firmware_updates(void);
 
 // ---- systemd_health.c -------------------------------------------------------
 void check_systemd_health(void);
@@ -123,5 +138,8 @@ void check_hardware_health(int check_only);
 void check_kernel_reboot(void);
 void check_stale_libs(void);
 void print_sys_summary(void);
+off_t get_pacman_log_offset(void);
+void parse_pacman_log_delta_buf(const char *buf, struct tx_summary *out);
+void summarize_pacman_log_delta(off_t start_offset, struct tx_summary *out);
 
 #endif // UPGRADE_H

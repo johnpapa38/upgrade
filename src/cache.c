@@ -3,7 +3,7 @@
 // Detects true orphaned dependencies via libalpm (`pacman -Qdtq` equivalent:
 // installed as a dependency and neither required nor optionally required by any
 // package). Skips spawning an external helper altogether when 0 orphans exist.
-void sweep_orphans(const char *aur_helper, int auto_yes) {
+void sweep_orphans(const char *aur_helper) {
   alpm_errno_t err;
   alpm_handle_t *handle = alpm_initialize("/", "/var/lib/pacman", &err);
   if (!handle)
@@ -58,12 +58,11 @@ void sweep_orphans(const char *aur_helper, int auto_yes) {
     printf(" %s", orphans[i]);
   printf("\n");
 
-  char *noconfirm = auto_yes ? "--noconfirm" : NULL;
   if (aur_helper && strcmp(aur_helper, "yay") == 0) {
-    char *const cmd[] = {"yay", "-Yc", noconfirm, NULL};
+    char *const cmd[] = {"yay", "-Yc", "--noconfirm", NULL};
     run_cmd(cmd);
   } else if (aur_helper && strcmp(aur_helper, "paru") == 0) {
-    char *const cmd[] = {"paru", "-c", noconfirm, NULL};
+    char *const cmd[] = {"paru", "-c", "--noconfirm", NULL};
     run_cmd(cmd);
   } else {
     char **args = malloc((count + 5) * sizeof(char *));
@@ -72,8 +71,7 @@ void sweep_orphans(const char *aur_helper, int auto_yes) {
       args[n++] = "sudo";
       args[n++] = "pacman";
       args[n++] = "-Rns";
-      if (auto_yes)
-        args[n++] = "--noconfirm";
+      args[n++] = "--noconfirm";
       for (size_t i = 0; i < count; i++)
         args[n++] = orphans[i];
       args[n] = NULL;
@@ -207,6 +205,7 @@ static int parse_cached_pkg(const char *fname, struct cached_pkg *out) {
 // sandbox cleanup. Keeps the newest 2 versions of installed packages and drops
 // all cached archives for uninstalled packages.
 void clean_pacman_cache(void) {
+  const int keep_versions = 2;
   if (access("/var/lib/pacman/db.lck", F_OK) == 0) {
     fprintf(stderr, CLR_YELLOW ":: Skipping cache trim: db.lck is held.\n"
                                CLR_RESET);
@@ -283,7 +282,9 @@ void clean_pacman_cache(void) {
     while (j < count && strcmp(items[i].pkgname, items[j].pkgname) == 0)
       j++;
 
-    size_t keep = (alpm_db_get_pkg(localdb, items[i].pkgname) != NULL) ? 2 : 0;
+    size_t keep = (alpm_db_get_pkg(localdb, items[i].pkgname) != NULL)
+                      ? (size_t)keep_versions
+                      : 0;
     for (size_t k = i + keep; k < j; k++) {
       char path[PATH_MAX];
       if (snprintf(path, sizeof(path), "%s/%s", cachedir, items[k].filename) <
@@ -326,8 +327,9 @@ void clean_pacman_cache(void) {
     }
   } else {
     printf(CLR_GREEN
-           "[✓] Pacman cache already clean (kept last 2 versions).\n"
-           CLR_RESET);
+           "[✓] Pacman cache already clean (kept last %d version(s)).\n"
+           CLR_RESET,
+           keep_versions);
   }
   if (dl_dirs > 0) {
     printf(CLR_GREEN
@@ -341,6 +343,7 @@ void clean_pacman_cache(void) {
 // (keep newest 2 versions of installed packages, drop uninstalled). Leaves
 // PKGBUILDs, git clones, and source files untouched.
 void clean_aur_cache(void) {
+  const int keep_versions = 2;
   const char *xdg = getenv("XDG_CACHE_HOME");
   const char *home = getenv("HOME");
   char cache_base[PATH_MAX];
@@ -456,7 +459,9 @@ void clean_aur_cache(void) {
     while (j < count && strcmp(items[i].pkgname, items[j].pkgname) == 0)
       j++;
 
-    size_t keep = (alpm_db_get_pkg(localdb, items[i].pkgname) != NULL) ? 2 : 0;
+    size_t keep = (alpm_db_get_pkg(localdb, items[i].pkgname) != NULL)
+                      ? (size_t)keep_versions
+                      : 0;
     for (size_t k = i + keep; k < j; k++) {
       struct stat st;
       if (lstat(items[k].filename, &st) == 0 && S_ISREG(st.st_mode) &&
@@ -495,8 +500,9 @@ void clean_aur_cache(void) {
     }
   } else {
     printf(CLR_GREEN
-           "[✓] AUR build cache already clean (kept last 2 versions).\n"
-           CLR_RESET);
+           "[✓] AUR build cache already clean (kept last %d version(s)).\n"
+           CLR_RESET,
+           keep_versions);
   }
 }
 
@@ -522,7 +528,7 @@ static unsigned long long sum_dir_bytes(const char *dir, int depth) {
     if (S_ISDIR(st.st_mode))
       total += sum_dir_bytes(path, depth + 1);
     else if (S_ISREG(st.st_mode))
-      total += (unsigned long long)st.st_size;
+      total += (unsigned long long)st.st_blocks * 512ULL;
   }
   closedir(d);
   return total;
@@ -531,7 +537,9 @@ static unsigned long long sum_dir_bytes(const char *dir, int depth) {
 // Audits /var/log/journal disk usage and trims archived systemd journals to
 // 500 MiB during maintenance when they grow beyond that cap.
 void clean_systemd_journal(int check_only) {
-  const unsigned long long cap_bytes = 500ULL * 1024ULL * 1024ULL;
+  const int cap_mib = 500;
+  const unsigned long long cap_bytes =
+      (unsigned long long)cap_mib * 1024ULL * 1024ULL;
   unsigned long long before = sum_dir_bytes("/var/log/journal", 0);
   if (before == 0)
     return;
@@ -539,9 +547,9 @@ void clean_systemd_journal(int check_only) {
   double before_mib = (double)before / (1024.0 * 1024.0);
   if (before <= cap_bytes) {
     if (!check_only) {
-      printf(CLR_GREEN "[✓] Systemd journal: %.1f MiB used (within 500 MiB "
+      printf(CLR_GREEN "[✓] Systemd journal: %.1f MiB used (within %d MiB "
                        "cap).\n" CLR_RESET,
-             before_mib);
+             before_mib, cap_mib);
     }
     return;
   }
@@ -556,14 +564,15 @@ void clean_systemd_journal(int check_only) {
   if (!have_cmd("journalctl"))
     return;
 
+  char vac_arg[32];
+  snprintf(vac_arg, sizeof(vac_arg), "--vacuum-size=%dM", cap_mib);
   char out[4096];
   int rc = -1;
   if (geteuid() == 0) {
-    char *const cmd[] = {"journalctl", "--vacuum-size=500M", NULL};
+    char *const cmd[] = {"journalctl", vac_arg, NULL};
     capture_cmd_output(cmd, out, sizeof(out), &rc);
   } else {
-    char *const cmd[] = {"sudo", "-n", "journalctl", "--vacuum-size=500M",
-                         NULL};
+    char *const cmd[] = {"sudo", "-n", "journalctl", vac_arg, NULL};
     capture_cmd_output(cmd, out, sizeof(out), &rc);
   }
 

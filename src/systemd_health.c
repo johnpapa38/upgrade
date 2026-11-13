@@ -440,28 +440,103 @@ void check_boot_coredumps(void) {
   }
 }
 
-// Reports the previous boot's total startup time and its critical dependency
-// chain. This is diagnostic only: it does not restart or alter any units.
+static double parse_sa_duration_s(const char *s, const char *end) {
+  double total = 0.0;
+  const char *p = s;
+  while (p < end) {
+    while (p < end && !isdigit((unsigned char)*p))
+      p++;
+    if (p >= end)
+      break;
+    char *after = NULL;
+    double val = strtod(p, &after);
+    if (!after || after == p || after > end)
+      break;
+    p = after;
+    if ((size_t)(end - p) >= 3 && strncmp(p, "min", 3) == 0) {
+      total += val * 60.0;
+      p += 3;
+    } else if ((size_t)(end - p) >= 2 && strncmp(p, "ms", 2) == 0) {
+      total += val / 1000.0;
+      p += 2;
+    } else if ((size_t)(end - p) >= 2 && strncmp(p, "us", 2) == 0) {
+      total += val / 1000000.0;
+      p += 2;
+    } else if (p < end && *p == 's') {
+      total += val;
+      p++;
+    } else if (p < end && *p == 'h') {
+      total += val * 3600.0;
+      p++;
+    }
+  }
+  return total;
+}
+
+// Reports the previous boot speed concisely; only expands the critical chain
+// when userspace boot exceeds 60 seconds.
 void check_boot_performance(void) {
-  if (access("/run/systemd/system", F_OK) != 0)
+  if (access("/run/systemd/system", F_OK) != 0 || !have_cmd("systemd-analyze"))
     return;
-  if (!have_cmd("systemd-analyze")) {
-    printf(CLR_MAGENTA "[i] Boot analysis unavailable: systemd-analyze not "
-                       "installed.\n" CLR_RESET);
-    return;
-  }
 
-  printf(CLR_CYAN "\n:: Last boot timing...\n" CLR_RESET);
+  char buf[2048];
+  int rc = -1;
   char *const time_cmd[] = {"systemd-analyze", "--no-pager", "time", NULL};
-  if (run_cmd(time_cmd) != 0) {
-    printf(CLR_YELLOW "[!] Could not read systemd boot timing.\n" CLR_RESET);
+  if (capture_cmd_output(time_cmd, buf, sizeof(buf), &rc) <= 0 || rc != 0)
     return;
+
+  char *nl = strchr(buf, '\n');
+  if (nl)
+    *nl = '\0';
+
+  const char *uspace_tag = strstr(buf, " (userspace)");
+  const char *eq = strstr(buf, " = ");
+  double userspace_s = 0.0;
+  char userspace_str[64] = "";
+  char total_str[64] = "";
+
+  if (uspace_tag) {
+    const char *start = uspace_tag;
+    while (start > buf && start[-1] != '+')
+      start--;
+    while (start < uspace_tag && (*start == ' ' || *start == '\t'))
+      start++;
+    if (uspace_tag > start) {
+      size_t len = (size_t)(uspace_tag - start);
+      if (len >= sizeof(userspace_str))
+        len = sizeof(userspace_str) - 1;
+      memcpy(userspace_str, start, len);
+      userspace_str[len] = '\0';
+      userspace_s = parse_sa_duration_s(start, uspace_tag);
+    }
+  }
+  if (eq) {
+    const char *ts = eq + 3;
+    while (*ts == ' ' || *ts == '\t')
+      ts++;
+    snprintf(total_str, sizeof(total_str), "%.63s", ts);
+    size_t tlen = strlen(total_str);
+    while (tlen > 0 &&
+           (total_str[tlen - 1] == ' ' || total_str[tlen - 1] == '\t' ||
+            total_str[tlen - 1] == '\r'))
+      total_str[--tlen] = '\0';
   }
 
-  printf(CLR_CYAN "\n:: Last boot critical chain...\n" CLR_RESET);
-  char *const chain_cmd[] = {"systemd-analyze", "--no-pager",
-                             "critical-chain", NULL};
-  if (run_cmd(chain_cmd) != 0)
-    printf(CLR_YELLOW "[!] Could not read the systemd critical boot chain.\n"
-                      CLR_RESET);
+  if (userspace_str[0] != '\0' && total_str[0] != '\0') {
+    if (userspace_s > 60.0) {
+      printf(CLR_YELLOW "[!] Slow boot: %s in userspace (%s total).\n"
+                        CLR_RESET,
+             userspace_str, total_str);
+      printf(CLR_CYAN ":: Slowest boot units...\n" CLR_RESET);
+      char *const chain_cmd[] = {"systemd-analyze", "--no-pager",
+                                 "critical-chain", NULL};
+      run_cmd(chain_cmd);
+    } else {
+      printf(CLR_GREEN "[✓] Last boot: %s in userspace (%s total).\n"
+                       CLR_RESET,
+             userspace_str, total_str);
+    }
+  } else if (buf[0] != '\0') {
+    printf(CLR_GREEN "[✓] Last boot: %s\n" CLR_RESET, buf);
+  }
 }
